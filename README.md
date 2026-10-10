@@ -17,6 +17,11 @@ features.
 
 ### Flash with M5Burner (easiest)
 
+![MeshWatch](m5burner/cover.png)
+
+The full listing — cover, description and manifest — is in
+[`m5burner/PUBLISH.md`](m5burner/PUBLISH.md).
+
 1. Open **M5Burner**, search for **MeshWatch** (or use *Add firmware* with
    `dist/meshwatch-m5sticks3-*.bin`).
 2. Select your StickS3's serial port and **Burn**. The image is a full 8 MB
