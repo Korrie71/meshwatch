@@ -37,7 +37,7 @@ enum Method : uint8_t {
   M_IBEACON, M_EDDYSTONE, M_FINDMY, M_TILE, M_SMARTTAG, M_CHIPOLO, M_FMDN,
   M_DEAUTH, M_KARMA, M_BLE_SPAM, M_FLIPPER, M_SKIMMER,
   M_PWNAGOTCHI, M_MESHTASTIC, M_CAM_OUI, M_CAM_SSID, M_ODID_WIFI, M_ODID_BLE,
-  M_CANARY_AP, M_CANARY_PROBE, M_COUNT
+  M_CANARY_AP, M_CANARY_PROBE, M_BEACON_SPAM, M_DRONE_SSID, M_TRACKER_NAME, M_COUNT
 };
 
 static const char* const METHOD_KEY[M_COUNT] = {
@@ -46,7 +46,7 @@ static const char* const METHOD_KEY[M_COUNT] = {
   "ibeacon", "eddystone", "findmy", "tile", "smarttag", "chipolo", "fmdn",
   "deauth", "karma_ssid_flood", "ble_advert_spam", "flipper_zero", "bt_serial_module",
   "pwnagotchi", "meshtastic", "camera_oui", "camera_ssid", "remoteid_wifi", "remoteid_ble",
-  "canary_evil_twin", "canary_probe"
+  "canary_evil_twin", "canary_probe", "wifi_beacon_spam", "drone_ssid", "tracker_name"
 };
 
 // Confidence 0-4. CONF_ALERT and up makes noise and raises the banner; lower
@@ -149,13 +149,43 @@ static const uint8_t CAMERA_OUIS[][3] = {
   {0xb8,0xa4,0x4f},{0x00,0x40,0x8c},{0xe8,0x27,0x25},{0xac,0xcc,0x8e},                 // Axis
 };
 static const size_t CAMERA_OUI_COUNT = sizeof(CAMERA_OUIS) / sizeof(CAMERA_OUIS[0]);
-// Case-insensitive SSID/BLE-name substrings common to consumer cameras.
+// Case-insensitive SSID/BLE-name substrings common to consumer, CCTV and action
+// / spy cameras. Action cams (GoPro, Osmo) and hidden-cam firmware (V380, iCSee,
+// P2P...) name their soft-AP distinctively, so a substring match is reliable.
 static const char* const CAMERA_NAMES[] = {
   "wyzecam", "wyze", "reolink", "ipcam", "ipc-", "ezviz", "tapo_", "tapo-cam", "arlo",
   "ring-", "nestcam", "hikvision", "dahua", "foscam", "amcrest", "lorex", "annke",
   "eufycam", "blink-", "insta360", "yicamera", "sricam", "vstarcam",
+  // action cameras
+  "gopro", "osmo-", "osmoaction", "akaso", "dji osmo",
+  // common hidden / cheap spy-cam soft-AP firmware names
+  "v380", "icsee", "p2p", "p2wifi", "cloudedge", "hdwificam", "wificam", "spycam",
+  "minicam", "a9-", "a9cam", "x5sw", "jpcam", "hd-cam", "camhi", "yoosee",
+  // more CCTV / NVR brands
+  "swann", "nightowl", "night owl", "zosi", "anran", "imou", "uniview", "besder",
+  "sv3c", "escam", "wansview", "sannce",
 };
 static const size_t CAMERA_NAME_COUNT = sizeof(CAMERA_NAMES) / sizeof(CAMERA_NAMES[0]);
+
+// Drones whose soft-AP / controller WiFi SSID carries the model family. These
+// are matched in addition to Open Drone ID (which many older or non-EU/US drones
+// do not broadcast), so a DJI/Autel/Parrot in WiFi mode is still caught.
+static const char* const DRONE_NAMES[] = {
+  "dji-", "dji_", "mavic", "phantom", "inspire", "matrice", "tello", "avata",
+  "dji mini", "dji air", "dji fpv", "autel", "evo-", "evo2", "anafi", "parrot",
+  "bebop", "skydio", "fimi", "holystone", "potensic",
+};
+static const size_t DRONE_NAME_COUNT = sizeof(DRONE_NAMES) / sizeof(DRONE_NAMES[0]);
+
+// BLE advertised names of item trackers beyond the ones matched by service UUID
+// (Tile, SmartTag, Chipolo, Find My). Some names are generic, so confidence is
+// kept modest.
+struct NameSig { const char* s; uint8_t conf; };
+static const NameSig TRACKER_NAMES[] = {
+  {"PebbleBee", 3}, {"Pebblebee", 3}, {"Nutale", 3}, {"Atuvos", 3}, {"AirCard", 2},
+  {"Rolling Square", 2}, {"iTag", 2}, {"TrackerPA", 2}, {"Nut3", 2}, {"Cube Tracker", 3},
+};
+static const size_t TRACKER_NAME_COUNT = sizeof(TRACKER_NAMES) / sizeof(TRACKER_NAMES[0]);
 
 // ----------------------------------------------------------- drone Remote ID
 // Open Drone ID. WiFi: NAN action frames to 51:6f:9a:01:00:00, or beacon
@@ -176,6 +206,11 @@ static const uint8_t ODID_NAN_DEST[6] = {0x51, 0x6f, 0x9a, 0x01, 0x00, 0x00};
 // Karma / SSID-flood: one transmitter beaconing many distinct SSIDs.
 #define KARMA_SSID_THRESHOLD 6     // distinct SSIDs from one BSSID -> rogue
 #define BLE_SPAM_THRESHOLD   22    // spam-type adverts per 3 s window
+
+// WiFi beacon-spam attack (ESP32 Marauder / Ghost ESP / Flipper WiFi): a flood
+// of beacons from many random (locally-administered) BSSIDs. Real APs use their
+// vendor OUI, so a high rate of random-MAC beacons in one window is the attack.
+#define WIFI_BEACON_SPAM_THRESHOLD 40   // random-MAC beacons per 3 s window
 
 // A tracker that stays in range across this many distinct minutes is flagged
 // as persistent (possibly travelling with you).

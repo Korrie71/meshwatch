@@ -21,7 +21,7 @@
 #include "signatures.h"
 #include "mesh.h"
 
-#define FW_VERSION "1.8.0"
+#define FW_VERSION "1.9.0"
 
 // ------------------------------------------------------------------- config
 #define CHANNEL_DWELL_MS   250
@@ -84,6 +84,8 @@ static volatile uint32_t deauthCount = 0;
 static uint8_t deauthBssid[6];
 static volatile uint32_t bleSpamCount = 0;
 static uint8_t bleSpamMac[6];
+static volatile uint32_t beaconSpamCount = 0;   // random-MAC beacons per window
+static uint8_t beaconSpamMac[6];
 
 // Karma / SSID-flood: a legitimate AP advertises one SSID; a Pineapple-style
 // rogue answers to many. Track distinct SSID hashes per BSSID in a small table.
@@ -238,10 +240,13 @@ static const char* labelFor(uint8_t cat, uint8_t method) {
     case CAT_MESH:    return method == M_MESHTASTIC ? "Meshtastic radio" : "MeshCore radio";
     case CAT_ROGUE:   return "Rogue AP (karma)";
     case CAT_ATTACK:
-      return method == M_FLIPPER ? "Flipper Zero" : "BLE advert spam";
+      return method == M_FLIPPER ? "Flipper Zero"
+           : method == M_BEACON_SPAM ? "WiFi beacon spam" : "BLE advert spam";
     case CAT_SKIMMER: return "Card-skimmer BT module";
     case CAT_CAMERA:  return "WiFi camera";
-    case CAT_DRONE:   return method == M_ODID_BLE ? "Drone (Remote ID, BLE)" : "Drone (Remote ID)";
+    case CAT_DRONE:
+      return method == M_ODID_BLE ? "Drone (Remote ID, BLE)"
+           : method == M_DRONE_SSID ? "Drone (WiFi)" : "Drone (Remote ID)";
     case CAT_CANARY:  return method == M_CANARY_AP ? "Canary: evil twin AP" : "Canary: someone probing";
     case CAT_TRACKER:
       switch (method) {
@@ -249,6 +254,7 @@ static const char* labelFor(uint8_t cat, uint8_t method) {
         case M_TILE:     return "Tile tracker";
         case M_SMARTTAG: return "Samsung SmartTag";
         case M_CHIPOLO:  return "Chipolo tracker";
+        case M_TRACKER_NAME: return "Item tracker";
         default:         return "Google FMD tracker";
       }
     default:
@@ -282,6 +288,19 @@ static bool cameraName(const char* name) {
   for (size_t i = 0; i < CAMERA_NAME_COUNT; i++)
     if (containsNoCase(name, CAMERA_NAMES[i])) return true;
   return false;
+}
+
+static bool droneName(const char* name) {
+  for (size_t i = 0; i < DRONE_NAME_COUNT; i++)
+    if (containsNoCase(name, DRONE_NAMES[i])) return true;
+  return false;
+}
+
+// Returns the confidence of a tracker-name match, or 0 for none.
+static uint8_t trackerName(const char* name) {
+  for (size_t i = 0; i < TRACKER_NAME_COUNT; i++)
+    if (containsNoCase(name, TRACKER_NAMES[i].s)) return TRACKER_NAMES[i].conf;
+  return 0;
 }
 
 static int flockOui(const uint8_t* mac) {
@@ -498,6 +517,8 @@ static void checkSsid(const uint8_t* ssid, int slen, const uint8_t* mac, int8_t 
     wifiHit(CAT_FLOCK, M_WIFI_SSID, 3, mac, rssi, name);
   } else if (strncasecmp(name, "Axon", 4) == 0) {
     wifiHit(CAT_AXON, M_WIFI_SSID, 3, mac, rssi, name);
+  } else if (droneName(name)) {
+    wifiHit(CAT_DRONE, M_DRONE_SSID, 3, mac, rssi, name);
   }
 }
 
@@ -566,6 +587,12 @@ static void wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
         checkPwnagotchi(ssid, slen, addr2, rssi);
         if (droneBeaconIE(p + off, len - off))
           wifiHit(CAT_DRONE, M_ODID_WIFI, 4, addr2, rssi, "Remote ID (beacon)");
+        // Beacon-spam attack: a flood of beacons from random (locally-
+        // administered) BSSIDs. Real APs beacon from their vendor OUI.
+        if ((addr2[0] & 0x02) && !(addr2[0] & 0x01)) {
+          memcpy(beaconSpamMac, addr2, 6);
+          beaconSpamCount++;
+        }
       } else if (subtype == 5) {
         trackKarma(addr2, ssid, slen, rssi);
       }
@@ -681,6 +708,14 @@ class ScanCB : public NimBLEAdvertisedDeviceCallbacks {
           bleHit(CAT_SKIMMER, M_SKIMMER, 3, mac, rssi, name);
           return;
         }
+      }
+      if (droneName(name)) {                           // DJI/Autel/etc. in BLE
+        bleHit(CAT_DRONE, M_DRONE_SSID, 3, mac, rssi, name);
+        return;
+      }
+      if (uint8_t tc = trackerName(name)) {            // named item trackers
+        bleHit(CAT_TRACKER, M_TRACKER_NAME, tc, mac, rssi, name);
+        return;
       }
     }
 
@@ -2068,6 +2103,18 @@ static void serialCommands() {
       static const uint8_t m[6] = {0x3c, 0x1a, 0x2b, 0x44, 0x55, 0x66};
       pushHit(CAT_DRONE, M_ODID_WIFI, 4, m, -60, 6, "Remote ID (beacon)");
     }
+    else if (!strcmp(cmd, "fakebspam")) {
+      static const uint8_t m[6] = {0xde, 0xad, 0xbe, 0xef, 0x00, 0x01};
+      pushHit(CAT_ATTACK, M_BEACON_SPAM, 3, m, -48, 6, "61 fake APs / 3 s");
+    }
+    else if (!strcmp(cmd, "fakedronewifi")) {
+      static const uint8_t m[6] = {0x60, 0x60, 0x1f, 0x11, 0x22, 0x33};
+      pushHit(CAT_DRONE, M_DRONE_SSID, 3, m, -58, 6, "Mavic-Air-2S");
+    }
+    else if (!strcmp(cmd, "faketracker")) {
+      static const uint8_t m[6] = {0x02, 0x7b, 0xee, 0x44, 0x55, 0x66};
+      pushHit(CAT_TRACKER, M_TRACKER_NAME, 3, m, -62, 0, "PebbleBee Clip");
+    }
     else if (!strcmp(cmd, "fakeconvoy")) wantFakeConvoy = true;
     else if (!strcmp(cmd, "fakerot")) {
       // same named unit, a new MAC each call: tests MAC-rotation grouping
@@ -2483,6 +2530,16 @@ void loop() {
       memcpy(sh.mac, bleSpamMac, 6);
       snprintf(sh.detail, sizeof(sh.detail), "%lu adverts / 3 s", (unsigned long)n);
       handleHit(sh);
+    }
+    uint32_t bn = beaconSpamCount;
+    beaconSpamCount = 0;
+    if (bn >= WIFI_BEACON_SPAM_THRESHOLD) {
+      Hit bh = {};
+      bh.cat = CAT_ATTACK; bh.method = M_BEACON_SPAM; bh.conf = 3; bh.rssi = -50;
+      bh.ch = curChannel;
+      memcpy(bh.mac, beaconSpamMac, 6);
+      snprintf(bh.detail, sizeof(bh.detail), "%lu fake APs / 3 s", (unsigned long)bn);
+      handleHit(bh);
     }
   }
 

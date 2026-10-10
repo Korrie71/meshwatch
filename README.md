@@ -34,7 +34,7 @@ pio run -t upload
 ### Flash the prebuilt binary manually
 
 ```sh
-esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v1.8.0-8MB.bin
+esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v1.9.0-8MB.bin
 ```
 
 
@@ -46,16 +46,16 @@ esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v1.8.0-8MB.bi
 | Flock battery pack | BLE name `Penguin-…` / `FS Ext Battery`, manufacturer ID 0x09C8 |
 | Raven gunshot sensor | BLE service UUIDs 0x3100-0x3500 |
 | Axon body cam / Taser | OUI 00:25:DF on BLE or WiFi, `Axon…` name or SSID |
-| Trackers | Find My (separated), Tile, SmartTag, Chipolo, Google Find My Device |
+| Trackers | Find My (separated), Tile, SmartTag, Chipolo, Google Find My Device, and named trackers (Pebblebee, Nutale, Atuvos, Cube, iTag...) |
 | Smart glasses | Meta company IDs / service UUID (also matches other Meta wearables) |
 | WiFi deauth flood | 20+ deauth/disassoc frames in 5 s |
 | Beacons | iBeacon, Eddystone (listed quietly) |
 | MeshCore radios | BLE name `MeshCore-…` (listed quietly) |
 | Rogue AP (karma) | one transmitter beaconing 6+ different SSIDs in 30 s (Pineapple-style) |
-| Attack tools | BLE advert spam flood; Flipper Zero by service UUID 0x308x, HID-from-ST-OUI (BadKB), attack-app names |
+| Attack tools | BLE advert spam flood; **WiFi beacon-spam flood** (40+ random-MAC fake APs in 3 s, e.g. Marauder / Ghost ESP); Flipper Zero by service UUID 0x308x, HID-from-ST-OUI (BadKB), attack-app names |
 | Card skimmers | BLE serial-module names HC-03/05/06/08, JDY-, AT-09, BT05, SPP-CA (also common in hobby kits) |
-| WiFi cameras | surveillance-camera vendor OUIs (Hikvision, Dahua, Reolink, Wyze, Ezviz, Arlo, Ring, Axis) and SSID/name substrings (wyzecam, reolink, tapo, ring-, nestcam, foscam, amcrest...) |
-| Drones | Open Drone ID / Remote ID over WiFi (NAN frames, beacon vendor IE) and BLE (service data 0xFFFA) |
+| WiFi / spy cameras | surveillance-camera vendor OUIs (Hikvision, Dahua, Reolink, Wyze, Ezviz, Arlo, Ring, Axis) and SSID/name substrings for CCTV, action cams (GoPro, Osmo) and cheap hidden-cam firmware (V380, iCSee, P2P, CloudEdge, Yoosee, CamHi, A9...) |
+| Drones | Open Drone ID / Remote ID over WiFi (NAN frames, beacon vendor IE) and BLE (service data 0xFFFA); **plus WiFi SSID / BLE name** for drones in WiFi mode (DJI/Mavic/Phantom/Tello, Autel/EVO, Parrot/Anafi, Skydio...) |
 | Pwnagotchi | WiFi beacon whose SSID is a JSON blob containing "pwnd_tot" (listed under Attack tools) |
 | Meshtastic radios | BLE 128-bit service UUID 6ba1b218-... (listed under MeshCore/mesh radios) |
 | Canary SSID | a bait network name you arm: an AP beaconing it (evil twin) or a client probing for it raises a Canary alert |
