@@ -34,7 +34,7 @@ pio run -t upload
 ### Flash the prebuilt binary manually
 
 ```sh
-esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v2.2.1-8MB.bin
+esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v2.3.0-8MB.bin
 ```
 
 
@@ -191,18 +191,19 @@ Other features:
   sweep has a fading trail and its blips glide to new distances, a small green
   "scanning" dot breathes in the header, and the screen fades in on wake. The UI
   runs at ~30 fps while animating and idles slowly to save power.
-- **Emulator / demo mode** (MENU → "Emulator (demo)", or SETTINGS → "Emulator
-  (demo, no RF)", or USB `emulate on`/`off`): injects synthetic detections for
-  every category through the real
-  detection pipeline — one device per category, plus a timed loop of behavioural
-  alerts (a tracker following you, a convoy forming, a canary evil-twin, a
-  deauth→handshake capture). It lets you exercise and demo the whole detector and
-  UI with **no hardware and no transmitting**. The header shows an amber **DEMO**
-  tag, mesh forwarding is suppressed, and the mode is never saved across reboot,
-  so emulated hits can't be mistaken for real ones. There is deliberately **no
-  over-the-air emulator**: transmitting the real signals would mean broadcasting
-  deauth floods, beacon spam, fake Remote ID and forced handshakes — the very
-  attacks MeshWatch exists to detect.
+- **Emulator / demo mode** (MENU → "Emulator (demo)" opens a picker, or SETTINGS →
+  "Emulator (demo, no RF)" for a quick toggle, or USB `emulate on`/`off`): injects
+  synthetic detections through the real detection pipeline so you can exercise and
+  demo the whole detector and UI with **no hardware and no transmitting**. The
+  picker screen (**EMULATOR (no RF)**) lets you choose exactly what it simulates:
+  per-category checkboxes plus four behavioural scenarios — a tracker following
+  you, a convoy forming, a canary evil-twin, and a deauth→handshake capture — and
+  a Start/Stop row. The header shows an amber **DEMO** tag, mesh forwarding is
+  suppressed, and the mode is never saved across reboot, so emulated hits can't be
+  mistaken for real ones. There is deliberately **no over-the-air emulator**:
+  transmitting the real signatures would mean spoofing specific real products and,
+  for trackers, tripping anti-stalking alerts on nearby people's phones, so the
+  emulator only ever feeds the detector internally.
 
 Debugging over USB serial: `firmware/shot.py` presses buttons and saves
 screenshots; the firmware also prints pairing diagnostics as JSON lines.
