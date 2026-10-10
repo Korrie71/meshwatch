@@ -21,7 +21,7 @@
 #include "signatures.h"
 #include "mesh.h"
 
-#define FW_VERSION "1.9.0"
+#define FW_VERSION "2.0.0"
 
 // ------------------------------------------------------------------- config
 #define CHANNEL_DWELL_MS   250
@@ -86,6 +86,9 @@ static volatile uint32_t bleSpamCount = 0;
 static uint8_t bleSpamMac[6];
 static volatile uint32_t beaconSpamCount = 0;   // random-MAC beacons per window
 static uint8_t beaconSpamMac[6];
+static volatile uint32_t lastDeauthMs = 0;      // for deauth-then-EAPOL correlation
+static volatile uint32_t eapolCount = 0;        // EAPOL key frames per window
+static uint8_t eapolBssid[6];
 
 // Karma / SSID-flood: a legitimate AP advertises one SSID; a Pineapple-style
 // rogue answers to many. Track distinct SSID hashes per BSSID in a small table.
@@ -118,6 +121,7 @@ static uint16_t findId = 0;
 static uint16_t screenOffSecs = 0;   // 0 = never
 static bool asleep = false;
 static uint32_t lastInput = 0;
+static uint32_t sessionStart = 0;   // sweep window start: boot, or last clear
 
 static Preferences uiPrefs;
 static bool fwdOn = false;
@@ -241,7 +245,9 @@ static const char* labelFor(uint8_t cat, uint8_t method) {
     case CAT_ROGUE:   return "Rogue AP (karma)";
     case CAT_ATTACK:
       return method == M_FLIPPER ? "Flipper Zero"
-           : method == M_BEACON_SPAM ? "WiFi beacon spam" : "BLE advert spam";
+           : method == M_BEACON_SPAM ? "WiFi beacon spam"
+           : method == M_HANDSHAKE ? "Handshake capture"
+           : method == M_PMKID ? "PMKID / EAPOL grab" : "BLE advert spam";
     case CAT_SKIMMER: return "Card-skimmer BT module";
     case CAT_CAMERA:  return "WiFi camera";
     case CAT_DRONE:
@@ -538,6 +544,25 @@ static void wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (mgmt && (subtype == 12 || subtype == 10)) {   // deauth / disassoc
     memcpy(deauthBssid, addr3, 6);
     deauthCount++;
+    lastDeauthMs = millis();
+  }
+
+  // EAPOL key frame (4-way handshake / PMKID): a data frame, not WEP/CCMP
+  // protected, whose LLC/SNAP EtherType is 0x888E. Seeing one right after a
+  // deauth is a forced handshake capture; a burst of them is also suspicious.
+  if (!mgmt && type == WIFI_PKT_DATA && !(p[1] & 0x40)) {   // not a protected frame
+    int hdr = 24;
+    if (subtype & 0x08) hdr += 2;                           // QoS data: QoS control
+    if (p[1] & 0x80) hdr += 4;                              // HT control present
+    if (len >= hdr + 8 &&
+        p[hdr] == 0xAA && p[hdr + 1] == 0xAA && p[hdr + 2] == 0x03 &&
+        p[hdr + 6] == 0x88 && p[hdr + 7] == 0x8E) {
+      memcpy(eapolBssid, addr3, 6);
+      eapolCount++;
+      uint32_t ld = lastDeauthMs;
+      if (ld && millis() - ld < DEAUTH_RECENT_MS)
+        wifiHit(CAT_ATTACK, M_HANDSHAKE, 4, addr3, rssi, "deauth + EAPOL capture");
+    }
   }
 
   // Drone Remote ID over WiFi NAN (addr1 is the fixed NAN cluster address).
@@ -1150,7 +1175,7 @@ static void handleHit(const Hit& h) {
 }
 
 // ----------------------------------------------------------------------- UI
-enum Screen : uint8_t { SCR_DETECT, SCR_MESH, SCR_THREAD, SCR_COMPOSE, SCR_TYPE, SCR_SETTINGS, SCR_PICK, SCR_SCAN, SCR_FIND, SCR_TRACK, SCR_BASELINE, SCR_RADAR };
+enum Screen : uint8_t { SCR_DETECT, SCR_MESH, SCR_THREAD, SCR_COMPOSE, SCR_TYPE, SCR_SETTINGS, SCR_PICK, SCR_SCAN, SCR_FIND, SCR_TRACK, SCR_BASELINE, SCR_RADAR, SCR_SUMMARY };
 static Screen screen = SCR_DETECT;
 static int sel = 0;                 // cursor in the current list
 static int curConv = -1;
@@ -1611,7 +1636,7 @@ static const char* const SCAN_NAME[CAT_COUNT] = {
 };
 
 // Rows 0-1 are apps, row 2 is "Scan all", rows 3.. are the categories.
-#define MENU_APPS 4
+#define MENU_APPS 5
 #define MENU_ROWS (CAT_COUNT + 1 + MENU_APPS)
 static void drawScan() {
   drawHeader("MENU");
@@ -1644,6 +1669,14 @@ static void drawScan() {
       for (auto& d : devs) if (d.used && millis() - d.last < ACTIVE_MS) n++;
       snprintf(right, 16, "%d live", n);
       *col = COL_OK;
+      return;
+    }
+    if (i == 4) {
+      strlcpy(left, " >  Sweep summary", 40);
+      int t = 0;
+      for (auto& d : devs) if (d.used && isThreat(d.cat) && d.conf >= CONF_ALERT) t++;
+      if (t) { snprintf(right, 16, "%d threats", t); *col = COL_BAD; }
+      else   { strlcpy(right, "clean", 16); *col = COL_OK; }
       return;
     }
     int cat = i - MENU_APPS - 1;
@@ -1877,6 +1910,92 @@ static void drawRadar() {
   drawHint("B refresh   hold B: back");
 }
 
+static int convoyUnits();   // defined later, next to the convoy detector
+
+// A one-screen verdict for the current sweep: is this place clean, what is the
+// worst thing seen, and did anything follow you or arrive as a convoy. Computed
+// live from the device table (what is here and recently seen).
+static void drawSummary() {
+  drawHeader("SWEEP SUMMARY");
+  uint32_t now = millis();
+  int total = 0, threats = 0, following = 0, strongest = -1;
+  int perCat[CAT_COUNT] = {};
+  for (int i = 0; i < MAX_DEVS; i++) {
+    const Dev& d = devs[i];
+    if (!d.used) continue;
+    total++;
+    if (d.persist) following++;
+    if (isThreat(d.cat) && d.conf >= CONF_ALERT) {
+      threats++;
+      perCat[d.cat]++;
+      if (strongest < 0 || d.peak > devs[strongest].peak) strongest = i;
+    }
+  }
+  int convoy = convoyUnits();
+
+  uint32_t secs = (now - sessionStart) / 1000;
+  char buf[48];
+  canvas.setFont(&fonts::Font0);
+  canvas.setTextColor(COL_DIM);
+  if (secs < 600) snprintf(buf, sizeof(buf), "scanned %lum %lus   %d devices seen",
+                           (unsigned long)(secs / 60), (unsigned long)(secs % 60), total);
+  else snprintf(buf, sizeof(buf), "scanned %lu min   %d devices seen",
+                (unsigned long)(secs / 60), total);
+  canvas.drawString(buf, 4, 17);
+
+  // verdict
+  canvas.setTextDatum(middle_center);
+  canvas.setFont(&fonts::FreeSansBold12pt7b);
+  if (threats == 0) {
+    canvas.setTextColor(COL_OK);
+    canvas.drawString("AREA CLEAN", 120, 42);
+  } else {
+    canvas.setTextColor(COL_BAD);
+    snprintf(buf, sizeof(buf), "%d THREAT%s", threats, threats == 1 ? "" : "S");
+    canvas.drawString(buf, 120, 42);
+  }
+  canvas.setTextDatum(top_left);
+
+  int y = 60;
+  if (strongest >= 0) {
+    const Dev& d = devs[strongest];
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(catColor(d.cat));
+    snprintf(buf, sizeof(buf), "worst: %s  %ddBm", labelFor(d.cat, d.method), d.peak);
+    canvas.drawString(buf, 4, y);
+    y += 12;
+    // up to three category tallies
+    canvas.setTextColor(COL_DIM);
+    char line[48] = "";
+    for (int c = 0; c < CAT_COUNT; c++) {
+      if (!perCat[c]) continue;
+      char seg[16];
+      snprintf(seg, sizeof(seg), "%d %s  ", perCat[c], CAT_SHORT[c]);
+      if (strlen(line) + strlen(seg) < sizeof(line)) strlcat(line, seg, sizeof(line));
+    }
+    canvas.drawString(line, 4, y);
+    y += 12;
+  }
+
+  if (following) {
+    canvas.setTextColor(COL_BAD);
+    snprintf(buf, sizeof(buf), "** %d following you **", following);
+    canvas.drawString(buf, 4, y);
+    y += 11;
+  }
+  if (convoy >= CONVOY_MIN) {
+    canvas.setTextColor(COL_BAD);
+    snprintf(buf, sizeof(buf), "** convoy: %d units **", convoy);
+    canvas.drawString(buf, 4, y);
+    y += 11;
+  }
+  if (!following && convoy < CONVOY_MIN && threats == 0) {
+    canvas.setTextColor(COL_FAINT);
+    canvas.drawString("nothing is tailing you", 4, y);
+  }
+  drawHint("B refresh   hold A: new sweep   hold B: back");
+}
+
 static void drawPick() {
   drawHeader("CHOOSE RADIO");
   mesh::Radio list[6];
@@ -1915,6 +2034,7 @@ static void draw() {
     case SCR_TRACK:    drawTrack(); break;
     case SCR_BASELINE: drawBaseline(); break;
     case SCR_RADAR:    drawRadar(); break;
+    case SCR_SUMMARY:  drawSummary(); break;
   }
   canvas.pushSprite(0, 0);
 }
@@ -2085,6 +2205,7 @@ static void serialCommands() {
     else if (!strncmp(cmd, "canary ", 7)) setCanary(cmd + 7);
     else if (!strcmp(cmd, "canary")) setCanary("");
     else if (!strcmp(cmd, "home")) { screen = SCR_DETECT; sel = 0; }
+    else if (!strcmp(cmd, "summary")) { screen = SCR_SUMMARY; sel = 4; }
     else if (!strcmp(cmd, "blescan")) bleDebugUntil = millis() + 25000;
     else if (!strcmp(cmd, "lockoff")) {
       lockOn = false; locked = false;
@@ -2106,6 +2227,10 @@ static void serialCommands() {
     else if (!strcmp(cmd, "fakebspam")) {
       static const uint8_t m[6] = {0xde, 0xad, 0xbe, 0xef, 0x00, 0x01};
       pushHit(CAT_ATTACK, M_BEACON_SPAM, 3, m, -48, 6, "61 fake APs / 3 s");
+    }
+    else if (!strcmp(cmd, "fakehandshake")) {
+      static const uint8_t m[6] = {0xa0, 0x63, 0x91, 0x12, 0x34, 0x56};
+      pushHit(CAT_ATTACK, M_HANDSHAKE, 4, m, -53, 6, "deauth + EAPOL capture");
     }
     else if (!strcmp(cmd, "fakedronewifi")) {
       static const uint8_t m[6] = {0x60, 0x60, 0x1f, 0x11, 0x22, 0x33};
@@ -2223,6 +2348,7 @@ static void handleButtons() {
         else if (sel == 1) go(SCR_FIND);
         else if (sel == 2) go(SCR_BASELINE);
         else if (sel == 3) go(SCR_RADAR);
+        else if (sel == 4) go(SCR_SUMMARY);
         else toggleScan(sel - MENU_APPS);
       }
       if (bHold) go(SCR_DETECT);
@@ -2248,6 +2374,11 @@ static void handleButtons() {
 
     case SCR_RADAR:
       if (bHold) { go(SCR_SCAN); sel = 3; }
+      break;
+
+    case SCR_SUMMARY:
+      if (aHold) { memset(devs, 0, sizeof(devs)); bannerDev = -1; sessionStart = millis(); }
+      if (bHold) { go(SCR_SCAN); sel = 4; }
       break;
 
     case SCR_TRACK:
@@ -2410,6 +2541,7 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   Serial.begin(115200);
+  sessionStart = millis();
   uiPrefs.begin("mwui", false);
   fwdOn = uiPrefs.getBool("fwd", false);
   fwdCh = uiPrefs.getUChar("fwdch", 0);
@@ -2541,6 +2673,18 @@ void loop() {
       snprintf(bh.detail, sizeof(bh.detail), "%lu fake APs / 3 s", (unsigned long)bn);
       handleHit(bh);
     }
+    uint32_t en = eapolCount;
+    eapolCount = 0;
+    // A burst of handshakes with no recent deauth (e.g. a PMKID sweep). The
+    // deauth-correlated case already alerted immediately in the sniffer.
+    if (en >= EAPOL_BURST && (!lastDeauthMs || now - lastDeauthMs > DEAUTH_RECENT_MS)) {
+      Hit eh = {};
+      eh.cat = CAT_ATTACK; eh.method = M_PMKID; eh.conf = 3; eh.rssi = -50;
+      eh.ch = curChannel;
+      memcpy(eh.mac, eapolBssid, 6);
+      snprintf(eh.detail, sizeof(eh.detail), "%lu EAPOL / 3 s", (unsigned long)en);
+      handleHit(eh);
+    }
   }
 
   mesh::loop();   // connecting to the radio blocks for a few seconds
@@ -2581,6 +2725,7 @@ void loop() {
     wantClear = false;
     memset(devs, 0, sizeof(devs));
     bannerDev = -1;
+    sessionStart = millis();
   }
   if (wantList) {
     wantList = false;

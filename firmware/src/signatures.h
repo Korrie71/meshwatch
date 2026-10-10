@@ -37,7 +37,8 @@ enum Method : uint8_t {
   M_IBEACON, M_EDDYSTONE, M_FINDMY, M_TILE, M_SMARTTAG, M_CHIPOLO, M_FMDN,
   M_DEAUTH, M_KARMA, M_BLE_SPAM, M_FLIPPER, M_SKIMMER,
   M_PWNAGOTCHI, M_MESHTASTIC, M_CAM_OUI, M_CAM_SSID, M_ODID_WIFI, M_ODID_BLE,
-  M_CANARY_AP, M_CANARY_PROBE, M_BEACON_SPAM, M_DRONE_SSID, M_TRACKER_NAME, M_COUNT
+  M_CANARY_AP, M_CANARY_PROBE, M_BEACON_SPAM, M_DRONE_SSID, M_TRACKER_NAME,
+  M_HANDSHAKE, M_PMKID, M_COUNT
 };
 
 static const char* const METHOD_KEY[M_COUNT] = {
@@ -46,7 +47,8 @@ static const char* const METHOD_KEY[M_COUNT] = {
   "ibeacon", "eddystone", "findmy", "tile", "smarttag", "chipolo", "fmdn",
   "deauth", "karma_ssid_flood", "ble_advert_spam", "flipper_zero", "bt_serial_module",
   "pwnagotchi", "meshtastic", "camera_oui", "camera_ssid", "remoteid_wifi", "remoteid_ble",
-  "canary_evil_twin", "canary_probe", "wifi_beacon_spam", "drone_ssid", "tracker_name"
+  "canary_evil_twin", "canary_probe", "wifi_beacon_spam", "drone_ssid", "tracker_name",
+  "wpa_handshake_capture", "pmkid_attack"
 };
 
 // Confidence 0-4. CONF_ALERT and up makes noise and raises the banner; lower
@@ -211,6 +213,15 @@ static const uint8_t ODID_NAN_DEST[6] = {0x51, 0x6f, 0x9a, 0x01, 0x00, 0x00};
 // of beacons from many random (locally-administered) BSSIDs. Real APs use their
 // vendor OUI, so a high rate of random-MAC beacons in one window is the attack.
 #define WIFI_BEACON_SPAM_THRESHOLD 40   // random-MAC beacons per 3 s window
+
+// WPA handshake / PMKID capture: the 4-way-handshake EAPOL key frames are sent
+// unencrypted, so they are visible as data frames carrying EtherType 0x888E. An
+// attacker forces a handshake by deauthing a client and catching the reconnect;
+// a PMKID attack solicits EAPOL message 1 (which carries the RSN PMKID) with no
+// client at all. We detect the EAPOL envelope and the deauth-then-EAPOL pattern.
+#define EAPOL_ETHERTYPE   0x888E
+#define DEAUTH_RECENT_MS  9000     // EAPOL within this of a deauth = forced capture
+#define EAPOL_BURST       5        // unforced EAPOL frames in a window -> suspicious
 
 // A tracker that stays in range across this many distinct minutes is flagged
 // as persistent (possibly travelling with you).
