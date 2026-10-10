@@ -1,0 +1,11 @@
+# build output
+firmware/.pio/
+# python envs
+.venv/
+*/.venv/
+# os
+.DS_Store
+# captured flash backup (large, device-specific)
+backup/*.bin
+# scratch
+*.tmp
