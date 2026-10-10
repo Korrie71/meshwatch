@@ -21,7 +21,7 @@
 #include "signatures.h"
 #include "mesh.h"
 
-#define FW_VERSION "2.1.0"
+#define FW_VERSION "2.1.1"
 
 // ------------------------------------------------------------------- config
 #define CHANNEL_DWELL_MS   250
@@ -1178,6 +1178,9 @@ static void handleHit(const Hit& h) {
 enum Screen : uint8_t { SCR_DETECT, SCR_MESH, SCR_THREAD, SCR_COMPOSE, SCR_TYPE, SCR_SETTINGS, SCR_PICK, SCR_SCAN, SCR_FIND, SCR_TRACK, SCR_BASELINE, SCR_RADAR, SCR_SUMMARY };
 static Screen screen = SCR_DETECT;
 static int sel = 0;                 // cursor in the current list
+static float hlY = -1;             // animated list-highlight Y (eased toward sel)
+static uint8_t hlScr = 255;        // screen the highlight belongs to
+static bool uiAnimating = false;   // true while the highlight is still sliding
 static int curConv = -1;
 static int scroll = 0;              // thread scroll, in lines
 static bool threadTop = false;
@@ -1407,17 +1410,30 @@ static void drawDetect() {
 }
 
 // Draws a scrolling list of n rows; row(i, buf, &right, &color) fills the text.
+// The selection highlight is a bar that eases toward the cursor row, so moving
+// the cursor slides smoothly instead of jumping.
 template <typename F>
 static void drawRows(int n, int top, int rows, F row) {
   int first = sel - rows / 2;
   if (first > n - rows) first = n - rows;
   if (first < 0) first = 0;
+
+  // animate the highlight toward the selected row's position
+  if (n > 0) {
+    float targetY = top + (sel - first) * 13 - 2;
+    if (hlScr != screen) { hlY = targetY; hlScr = screen; }   // snap on screen change
+    hlY += (targetY - hlY) * 0.4f;
+    if (fabsf(targetY - hlY) < 0.5f) hlY = targetY;
+    uiAnimating = fabsf(targetY - hlY) > 0.5f;
+    canvas.fillRect(0, (int)(hlY + 0.5f), 240, 13, 0x2145);     // highlight bar
+    canvas.fillRect(0, (int)(hlY + 0.5f), 2, 13, COL_BRAND);    // left accent
+  }
+
   for (int r = 0; r < rows && first + r < n; r++) {
     int i = first + r, y = top + r * 13;
     char left[44] = "", right[24] = "";
     uint16_t col = TFT_WHITE;
     row(i, left, right, &col);
-    if (i == sel) canvas.fillRect(0, y - 2, 240, 13, 0x2145);
     canvas.setTextColor(col);
     canvas.drawString(left, 6, y);
     canvas.drawRightString(right, 236, y);
@@ -2030,6 +2046,7 @@ static void draw() {
   canvas.fillScreen(TFT_BLACK);
   canvas.setFont(&fonts::Font0);
   canvas.setTextDatum(top_left);
+  uiAnimating = false;             // drawRows re-sets this while a highlight slides
   bool banner = millis() < bannerUntil &&
                 (bannerConvoy > 0 || bannerConv >= 0 || (bannerDev >= 0 && devs[bannerDev].used));
   if (banner && screen != SCR_TYPE) drawBanner();
@@ -2291,6 +2308,7 @@ static void handleButtons() {
   if (a || b || aHold || bHold) {
     bannerUntil = 0;
     bannerConvoy = 0;
+    uiAnimating = true;              // start redrawing fast so the slide is smooth
     bool wasAsleep = asleep;
     wake();
     if (wasAsleep) return;                // the first press only wakes the screen
@@ -2852,7 +2870,12 @@ void loop() {
     lastStatus = now;
     emitStatus();
   }
-  if (!asleep && now - lastDraw >= (screen == SCR_TYPE || screen == SCR_TRACK ? 60 : 200)) {
+  // Redraw fast (~30 fps) for anything that is animating — the radar sweep, the
+  // type/track screens, a live banner, or a sliding list highlight — and slowly
+  // otherwise to save power.
+  bool animated = screen == SCR_TYPE || screen == SCR_TRACK || screen == SCR_RADAR ||
+                  screen == SCR_SUMMARY || now < bannerUntil || uiAnimating;
+  if (!asleep && now - lastDraw >= (animated ? 33u : 110u)) {
     lastDraw = now;
     draw();
   }
