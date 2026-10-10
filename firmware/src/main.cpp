@@ -21,7 +21,7 @@
 #include "signatures.h"
 #include "mesh.h"
 
-#define FW_VERSION "1.4.0"
+#define FW_VERSION "1.5.0"
 
 // ------------------------------------------------------------------- config
 #define CHANNEL_DWELL_MS   250
@@ -61,7 +61,7 @@ struct Dev {
   uint8_t  cat, method, conf, ch;
   uint8_t  mac[6];
   int8_t   rssi, peak;
-  bool     persist, fwdPending, known, isNew, hasPos;
+  bool     persist, fwdPending, known, isNew, hasPos, ign;
   float    lat, lon;
   uint16_t id, minutes;
   uint32_t first, last, lastEmit, lastMinute, lastFwd, count;
@@ -149,6 +149,32 @@ static void blAdd(uint16_t h) {
   if (blKnown(h) || blCount >= (sizeof(blHashes) / sizeof(blHashes[0]))) return;
   blHashes[blCount++] = h;
 }
+
+// Ignore list: devices you have marked as yours, silenced permanently. Stored
+// as MAC hashes in flash.
+static uint16_t ignHashes[96];
+static uint16_t ignCount = 0;
+static bool ignored(uint16_t h) {
+  for (uint16_t i = 0; i < ignCount; i++) if (ignHashes[i] == h) return true;
+  return false;
+}
+static void ignToggle(uint16_t h) {
+  for (uint16_t i = 0; i < ignCount; i++) {
+    if (ignHashes[i] == h) {                       // remove
+      ignHashes[i] = ignHashes[--ignCount];
+      uiPrefs.putBytes("ign", ignHashes, ignCount * 2);
+      return;
+    }
+  }
+  if (ignCount < (sizeof(ignHashes) / sizeof(ignHashes[0]))) {
+    ignHashes[ignCount++] = h;
+    uiPrefs.putBytes("ign", ignHashes, ignCount * 2);
+  }
+}
+
+// Close-range alarm: a threat stronger than this gets an urgent repeating tone.
+static bool closeAlarm = false;
+#define CLOSE_RSSI -52
 
 // ------------------------------------------------------------------ helpers
 static bool isThreat(uint8_t cat) { return cat != CAT_BEACON && cat != CAT_TRACKER && cat != CAT_MESH; }
@@ -870,7 +896,14 @@ static void raise(int idx, bool persist) {
   bannerConv = -1;
   devs[idx].fwdPending = true;
   bannerUntil = millis() + BANNER_MS;
-  alertSound(devs[idx].cat, persist);
+  const Dev& rd = devs[idx];
+  if (closeAlarm && !muted && isThreat(rd.cat) && rd.rssi >= CLOSE_RSSI) {
+    M5.Speaker.tone(3000, 90);                       // urgent: threat is very close
+    M5.Speaker.tone(2200, 90, -1, false);
+    M5.Speaker.tone(3000, 90, -1, false);
+  } else {
+    alertSound(rd.cat, persist);
+  }
   logEvent(devs[idx]);
 }
 
@@ -930,6 +963,7 @@ static void handleHit(const Hit& h) {
   uint16_t mh = macHash(h.mac);
   if (baselineState == BL_LEARNING) blAdd(mh);
   d.known = baselineState == BL_ACTIVE && blKnown(mh);
+  d.ign = ignored(mh);
   double gla, glo;
   if (mesh::pos(&gla, &glo)) { d.lat = gla; d.lon = glo; d.hasPos = true; }
 
@@ -944,14 +978,15 @@ static void handleHit(const Hit& h) {
     }
   }
 
-  bool suppress = baselineState == BL_ACTIVE && d.known;
+  bool suppress = (baselineState == BL_ACTIVE && d.known) || d.ign;
   if (nowPersistent && !suppress) {
     raise(i, true);
     d.lastEmit = now;
     emitDev(d, "persist");
   } else if (fresh || upgraded) {
     bool doAlert;
-    if (baselineState == BL_ACTIVE) doAlert = fresh && !d.known;   // anything new to the area
+    if (d.ign) doAlert = false;
+    else if (baselineState == BL_ACTIVE) doAlert = fresh && !d.known;   // anything new to the area
     else doAlert = isThreat(d.cat) && d.conf >= CONF_ALERT;
     if (doAlert) {
       d.isNew = baselineState == BL_ACTIVE && !d.known;
@@ -966,7 +1001,7 @@ static void handleHit(const Hit& h) {
 }
 
 // ----------------------------------------------------------------------- UI
-enum Screen : uint8_t { SCR_DETECT, SCR_MESH, SCR_THREAD, SCR_COMPOSE, SCR_TYPE, SCR_SETTINGS, SCR_PICK, SCR_SCAN, SCR_FIND, SCR_TRACK, SCR_BASELINE };
+enum Screen : uint8_t { SCR_DETECT, SCR_MESH, SCR_THREAD, SCR_COMPOSE, SCR_TYPE, SCR_SETTINGS, SCR_PICK, SCR_SCAN, SCR_FIND, SCR_TRACK, SCR_BASELINE, SCR_RADAR, SCR_EVLOG };
 static Screen screen = SCR_DETECT;
 static int sel = 0;                 // cursor in the current list
 static int curConv = -1;
@@ -1303,7 +1338,7 @@ static void drawType() {
   drawHint("A pick, hold: del   B next, hold: fast");
 }
 
-#define SETTING_COUNT 12
+#define SETTING_COUNT 14
 static void drawSettings() {
   drawHeader("SETTINGS");
   drawRows(SETTING_COUNT, 19, 8, [&](int i, char* left, char* right, uint16_t* col) {
@@ -1376,6 +1411,15 @@ static void drawSettings() {
         strlcpy(right, reportOn ? "on" : "off", 16);
         if (reportOn) *col = COL_MINE;
         break;
+      case 12:
+        strlcpy(left, "Close-range alarm", 40);
+        strlcpy(right, closeAlarm ? "on" : "off", 16);
+        if (closeAlarm) *col = COL_MINE;
+        break;
+      case 13:
+        strlcpy(left, "Silenced devices", 40);
+        snprintf(right, 16, ignCount ? "%u - clear" : "none", ignCount);
+        break;
     }
   });
   drawHint(sel == 0 ? "A choose radio   hold A: forget" : "A change   B next   hold B: detect");
@@ -1389,7 +1433,7 @@ static const char* const SCAN_NAME[CAT_COUNT] = {
 };
 
 // Rows 0-1 are apps, row 2 is "Scan all", rows 3.. are the categories.
-#define MENU_APPS 3
+#define MENU_APPS 5
 #define MENU_ROWS (CAT_COUNT + 1 + MENU_APPS)
 static void drawScan() {
   drawHeader("MENU");
@@ -1414,6 +1458,20 @@ static void drawScan() {
       strlcpy(left, " >  Baseline watch", 40);
       strlcpy(right, baselineState == BL_ACTIVE ? "active" : baselineState == BL_LEARNING ? "learning" : "off", 16);
       if (baselineState != BL_OFF) *col = COL_MINE;
+      return;
+    }
+    if (i == 3) {
+      strlcpy(left, " >  Radar", 40);
+      int n = 0;
+      for (auto& d : devs) if (d.used && millis() - d.last < ACTIVE_MS) n++;
+      snprintf(right, 16, "%d live", n);
+      *col = COL_OK;
+      return;
+    }
+    if (i == 4) {
+      strlcpy(left, " >  Evidence log", 40);
+      snprintf(right, 16, "%u saved", evUsed);
+      *col = COL_OK;
       return;
     }
     int cat = i - MENU_APPS - 1;
@@ -1453,14 +1511,14 @@ static void drawFind() {
     else snprintf(left, 36, "%-6s %02x:%02x:%02x:%02x:%02x:%02x", CAT_SHORT[d.cat], d.mac[0], d.mac[1],
                   d.mac[2], d.mac[3], d.mac[4], d.mac[5]);
     left[30] = '\0';
-    snprintf(right, 16, "%d", d.rssi);
-    *col = millis() - d.last < ACTIVE_MS ? catColor(d.cat) : COL_DIM;
+    snprintf(right, 16, d.ign ? "mute %d" : "%d", d.rssi);
+    *col = d.ign ? COL_FAINT : (millis() - d.last < ACTIVE_MS ? catColor(d.cat) : COL_DIM);
   });
   if (!n) {
     canvas.setTextColor(COL_FAINT);
     canvas.drawCentreString("nothing detected yet", 120, 60);
   }
-  drawHint("A track   B next   hold B: back");
+  drawHint("A track  B next  hold A: silence  hold B: back");
 }
 
 static bool findValid() {
@@ -1604,6 +1662,73 @@ static void drawBaseline() {
   }
 }
 
+// Radar: active detections placed by signal strength (radius) and a stable
+// per-MAC angle, coloured by category. A sweep line animates.
+static void drawRadar() {
+  drawHeader("RADAR");
+  const int cx = 120, cy = 72, R = 52;
+  uint32_t now = millis();
+  for (int r = R; r > 0; r -= R / 3) canvas.drawCircle(cx, cy, r, 0x18E3);
+  canvas.drawFastHLine(cx - R, cy, 2 * R, 0x18E3);
+  canvas.drawFastVLine(cx, cy - R, 2 * R, 0x18E3);
+  // sweep
+  float sweep = (now % 3000) / 3000.0f * 6.2832f;
+  canvas.drawLine(cx, cy, cx + cosf(sweep) * R, cy + sinf(sweep) * R, 0x3DEA);
+
+  int live = 0, strongest = -1;
+  for (int i = 0; i < MAX_DEVS; i++) {
+    const Dev& d = devs[i];
+    if (!d.used || now - d.last > ACTIVE_MS) continue;
+    if (!(scanMask & (1 << d.cat))) continue;
+    live++;
+    if (strongest < 0 || d.rssi > devs[strongest].rssi) strongest = i;
+    float ang = (macHash(d.mac) % 360) * 0.01745f;
+    float rad = R * (1.0f - constrain((d.rssi + 95) / 60.0f, 0.0f, 1.0f));
+    int x = cx + cosf(ang) * rad, y = cy + sinf(ang) * rad;
+    uint16_t c = d.ign ? COL_FAINT : catColor(d.cat);
+    canvas.fillCircle(x, y, isThreat(d.cat) ? 3 : 2, c);
+    if (isThreat(d.cat) && !d.ign && (now / 400) % 2) canvas.drawCircle(x, y, 5, c);
+  }
+  canvas.fillCircle(cx, cy, 2, COL_OK);
+
+  canvas.setFont(&fonts::Font0);
+  canvas.setTextColor(COL_DIM);
+  char buf[40];
+  snprintf(buf, sizeof(buf), "%d in range   center = you", live);
+  canvas.drawCentreString(buf, 120, 128 - 6);
+  if (strongest >= 0) {
+    const Dev& d = devs[strongest];
+    canvas.setTextColor(catColor(d.cat));
+    snprintf(buf, sizeof(buf), "closest: %s %ddBm", labelFor(d.cat, d.method), d.rssi);
+    canvas.drawString(buf, 4, 18);
+  }
+  drawHint("B refresh   hold B: back");
+}
+
+static void drawEvlog() {
+  drawHeader("EVIDENCE LOG");
+  if (evUsed == 0) {
+    canvas.setTextColor(COL_FAINT);
+    canvas.drawCentreString("no alerts logged yet", 120, 60);
+    drawHint("hold B: back");
+    return;
+  }
+  // newest first
+  drawRows(evUsed, 19, 8, [&](int i, char* left, char* right, uint16_t* col) {
+    const LogEvt& e = evlog[evUsed - 1 - i];
+    char when[12] = "--:--";
+    if (e.epoch) {
+      time_t t = e.epoch; struct tm tm; localtime_r(&t, &tm);
+      snprintf(when, sizeof(when), "%02d:%02d", tm.tm_hour, tm.tm_min);
+    }
+    snprintf(left, 40, "%s %-5s %02x%02x%02x", when, CAT_SHORT[e.cat < CAT_COUNT ? e.cat : 0],
+             e.mac[3], e.mac[4], e.mac[5]);
+    snprintf(right, 16, "c%u %d", e.conf, e.rssi);
+    *col = catColor(e.cat < CAT_COUNT ? e.cat : 0);
+  });
+  drawHint("B scroll   hold A: clear   hold B: back");
+}
+
 static void drawPick() {
   drawHeader("CHOOSE RADIO");
   mesh::Radio list[6];
@@ -1641,6 +1766,8 @@ static void draw() {
     case SCR_FIND:     drawFind(); break;
     case SCR_TRACK:    drawTrack(); break;
     case SCR_BASELINE: drawBaseline(); break;
+    case SCR_RADAR:    drawRadar(); break;
+    case SCR_EVLOG:    drawEvlog(); break;
   }
   canvas.pushSprite(0, 0);
 }
@@ -1757,6 +1884,15 @@ static void changeSetting(int i) {
     case 11:
       reportOn = !reportOn;
       uiPrefs.putBool("report", reportOn);
+      break;
+    case 12:
+      closeAlarm = !closeAlarm;
+      uiPrefs.putBool("close", closeAlarm);
+      break;
+    case 13:
+      ignCount = 0;
+      uiPrefs.remove("ign");
+      for (auto& d : devs) d.ign = false;
       break;
     case 6:
       brightness = brightness >= 250 ? 30 : brightness >= 160 ? 255 : brightness >= 90 ? 160 : 90;
@@ -1911,6 +2047,8 @@ static void handleButtons() {
         if (sel == 0) go(SCR_MESH);
         else if (sel == 1) go(SCR_FIND);
         else if (sel == 2) go(SCR_BASELINE);
+        else if (sel == 3) go(SCR_RADAR);
+        else if (sel == 4) go(SCR_EVLOG);
         else toggleScan(sel - MENU_APPS);
       }
       if (bHold) go(SCR_DETECT);
@@ -1920,16 +2058,32 @@ static void handleButtons() {
       int list[MAX_DEVS];
       int n = findList(list);
       if (b && n) sel = (sel + 1) % n;
-      if (a && n) {
+      if (aHold && n) {                               // silence / unsilence this device
+        ignToggle(macHash(devs[list[sel]].mac));
+        devs[list[sel]].ign = ignored(macHash(devs[list[sel]].mac));
+      } else if (a && n) {
         findIdx = list[sel];
         findId = devs[findIdx].id;
         memcpy(findMac, devs[findIdx].mac, 6);
         finding = true;
         screen = SCR_TRACK;
       }
-      if (bHold) { go(SCR_SCAN); sel = 1; }
+      if (bHold) { go(SCR_SCAN); sel = 3; }
       break;
     }
+
+    case SCR_RADAR:
+      if (bHold) { go(SCR_SCAN); sel = 3; }
+      break;
+
+    case SCR_EVLOG:
+      if (b && evUsed) sel = (sel + 1) % evUsed;
+      if (aHold) {
+        evUsed = 0;
+        uiPrefs.remove("evlog");
+      }
+      if (bHold) { go(SCR_SCAN); sel = 4; }
+      break;
 
     case SCR_TRACK:
       if (a) muted = !muted;
@@ -2046,6 +2200,12 @@ void setup() {
   screenOffSecs = uiPrefs.getUShort("soff", 0);
   stealthOn = uiPrefs.getBool("stealth", false);
   reportOn = uiPrefs.getBool("report", false);
+  closeAlarm = uiPrefs.getBool("close", false);
+  size_t ignBytes = uiPrefs.getBytesLength("ign");
+  if (ignBytes && ignBytes <= sizeof(ignHashes) && ignBytes % 2 == 0) {
+    uiPrefs.getBytes("ign", ignHashes, ignBytes);
+    ignCount = ignBytes / 2;
+  }
   lockOn = uiPrefs.getBool("lockon", false);
   lockPin = uiPrefs.getUInt("lockpin", 0);
   duressPin = uiPrefs.getUInt("duress", 0);

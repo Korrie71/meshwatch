@@ -34,7 +34,7 @@ pio run -t upload
 ### Flash the prebuilt binary manually
 
 ```sh
-esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v1.4.0-8MB.bin
+esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v1.5.0-8MB.bin
 ```
 
 
@@ -131,6 +131,18 @@ Other features:
 - **Screen off after** (SETTINGS): never / 15 / 60 / 300 s. Scanning continues;
   any button, alert or incoming message wakes it. The first press only wakes.
 - **Announce me on the mesh** (SETTINGS): sends a flood advert from the radio.
+
+- **Radar** (MENU): a live sweep showing every in-range detection placed by
+  signal strength (distance from centre) and a stable per-device angle, coloured
+  by category; names the closest one.
+- **Evidence log viewer** (MENU): browse the flash-stored alert log on the
+  device, newest first, with timestamp, category, MAC, confidence and signal;
+  hold A to clear.
+- **Silence a device**: in the Signal finder, hold A to permanently ignore a
+  device (e.g. your own gear). Ignored devices never alert and are listed muted;
+  clear the list from Settings.
+- **Close-range alarm** (SETTINGS): when a threat comes within about -52 dBm,
+  the alert switches to an urgent repeating tone.
 
 Debugging over USB serial: `firmware/shot.py` presses buttons and saves
 screenshots; the firmware also prints pairing diagnostics as JSON lines.
