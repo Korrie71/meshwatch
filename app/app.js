@@ -422,13 +422,19 @@ function onDetEvent(ev) {
     $("muteOn").checked = !!ev.mute;
     return renderDetections();
   }
+  if (ev.t === "convoy") {
+    toast(`CONVOY — ${ev.n} units may be tailing you`, true);
+    if (cfg.vibOn && navigator.vibrate) navigator.vibrate([200, 80, 200, 80, 200]);
+    if ($("tab-detections").hidden) unseenThreats++;
+    return;
+  }
   if (ev.t !== "det") return;
   const key = ev.cat + "|" + ev.mac;
   const last = Date.now() - ev.age * 1000;
   const r = log[key] || (log[key] = { cat: ev.cat, mac: ev.mac, first: last - ev.dur * 1000 });
   Object.assign(r, { lbl: ev.lbl, m: ev.m, rssi: ev.rssi, pk: Math.max(ev.pk, r.pk ?? -127),
                      conf: Math.max(ev.conf, r.conf || 0), d: ev.d || r.d, last,
-                     persist: !!ev.persist || !!r.persist });
+                     persist: !!ev.persist || !!r.persist, rot: !!ev.rot || !!r.rot });
   if (geo && ev.age < 10) {
     r.pos = geo;
     r.pos0 = r.pos0 || geo;

@@ -187,3 +187,10 @@ static const uint8_t ODID_NAN_DEST[6] = {0x51, 0x6f, 0x9a, 0x01, 0x00, 0x00};
 // If the radio reports position: a device that stays in range while you travel
 // at least this far (metres) is flagged as following, whatever its type.
 #define FOLLOW_MOVE_M 120.0f
+
+// Convoy / hand-off detection: a surveillance team rotates units so no single
+// device lingers long enough to trip "following". This many distinct mobile
+// devices, each seen across 2+ minute-windows and still around, is a convoy.
+#define CONVOY_MIN 3
+#define CONVOY_WINDOW_MS 360000   // "still around" = seen within the last 6 min
+#define CONVOY_COOLDOWN_MS 300000 // re-alert at most every 5 min

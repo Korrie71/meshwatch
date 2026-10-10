@@ -21,7 +21,7 @@
 #include "signatures.h"
 #include "mesh.h"
 
-#define FW_VERSION "1.7.0"
+#define FW_VERSION "1.8.0"
 
 // ------------------------------------------------------------------- config
 #define CHANNEL_DWELL_MS   250
@@ -53,6 +53,7 @@ struct Hit {
   uint8_t cat, method, conf, ch;
   int8_t  rssi;
   uint8_t mac[6];
+  uint16_t fp;                 // identity fingerprint for MAC-rotation grouping
   char    detail[48];
 };
 
@@ -61,9 +62,9 @@ struct Dev {
   uint8_t  cat, method, conf, ch;
   uint8_t  mac[6];
   int8_t   rssi, peak;
-  bool     persist, fwdPending, known, isNew, hasPos, ign, hadFirstPos;
+  bool     persist, fwdPending, known, isNew, hasPos, ign, hadFirstPos, rotated;
   float    lat, lon, firstLat, firstLon, movedM;
-  uint16_t id, minutes;
+  uint16_t id, minutes, fp;
   uint32_t first, last, lastEmit, lastMinute, lastFwd, count;
   char     detail[48];
 };
@@ -94,6 +95,7 @@ static volatile bool appConnected = false;
 static volatile bool wantList = false;
 static volatile bool wantClear = false;
 static volatile bool wantFakeFollow = false;
+static volatile bool wantFakeConvoy = false;
 static volatile bool wantCanary = false;
 static char canaryPending[33] = "";
 static volatile uint16_t appMtu = 23;
@@ -101,7 +103,8 @@ static volatile uint16_t appMtu = 23;
 static M5Canvas canvas(&M5.Display);
 static uint32_t bannerUntil = 0;
 static int bannerDev = -1;       // detection banner, or
-static int bannerConv = -1;      // incoming-message banner
+static int bannerConv = -1;      // incoming-message banner, or
+static int bannerConvoy = 0;     // convoy / team-tail banner (count of units)
 
 // Signal finder: the device being hunted is exempt from throttling so its
 // signal strength updates as fast as it transmits.
@@ -309,11 +312,31 @@ static bool throttled(Recent* cache, size_t n, uint8_t* cursor, const uint8_t* m
   return false;
 }
 
+// A stable identity fingerprint from the device's own advertised name, so a
+// device that rotates its MAC (randomised BLE address) but keeps its name is
+// recognised as the same unit. Only for mobile categories that carry a specific
+// per-device name; shared or generic names (cameras, mesh, beacons) are left at
+// 0 so two of the same model are never merged.
+static bool fingerprintCat(uint8_t c) {
+  return c == CAT_TRACKER || c == CAT_AXON || c == CAT_GLASSES || c == CAT_ATTACK ||
+         c == CAT_SKIMMER || c == CAT_FLOCK;
+}
+static uint16_t fingerprint(uint8_t cat, const char* detail) {
+  if (!fingerprintCat(cat) || !detail) return 0;
+  size_t n = strlen(detail);
+  if (n < 5) return 0;                              // too short to be distinctive
+  uint32_t h = 2166136261u ^ (cat * 131u);         // FNV-1a over cat + name
+  for (size_t i = 0; i < n; i++) h = (h ^ (uint8_t)detail[i]) * 16777619u;
+  uint16_t fp = (uint16_t)(h ^ (h >> 16));
+  return fp ? fp : 1;
+}
+
 static void pushHit(uint8_t cat, uint8_t method, uint8_t conf, const uint8_t* mac,
                     int8_t rssi, uint8_t ch, const char* detail) {
   Hit h;
   h.cat = cat; h.method = method; h.conf = conf; h.ch = ch; h.rssi = rssi;
   memcpy(h.mac, mac, 6);
+  h.fp = fingerprint(cat, detail);
   strlcpy(h.detail, detail ? detail : "", sizeof(h.detail));
   xQueueSend(hitQ, &h, 0);
 }
@@ -844,12 +867,12 @@ static void emitDev(const Dev& d, const char* ev) {
   snprintf(line, sizeof(line),
     "{\"t\":\"det\",\"ev\":\"%s\",\"id\":%u,\"cat\":\"%s\",\"m\":\"%s\",\"lbl\":\"%s\","
     "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"rssi\":%d,\"pk\":%d,\"conf\":%u,"
-    "\"n\":%lu,\"ch\":%u,\"age\":%lu,\"dur\":%lu,\"persist\":%d,\"hp\":%d,\"lat\":%.6f,\"lon\":%.6f,\"d\":\"%s\"}",
+    "\"n\":%lu,\"ch\":%u,\"age\":%lu,\"dur\":%lu,\"persist\":%d,\"rot\":%d,\"hp\":%d,\"lat\":%.6f,\"lon\":%.6f,\"d\":\"%s\"}",
     ev, d.id, CAT_KEY[d.cat], METHOD_KEY[d.method], labelFor(d.cat, d.method),
     d.mac[0], d.mac[1], d.mac[2], d.mac[3], d.mac[4], d.mac[5], d.rssi, d.peak, d.conf,
     (unsigned long)d.count, d.ch, (unsigned long)((now - d.last) / 1000),
-    (unsigned long)((d.last - d.first) / 1000), d.persist ? 1 : 0, d.hasPos ? 1 : 0,
-    d.hasPos ? d.lat : 0, d.hasPos ? d.lon : 0, d.detail);
+    (unsigned long)((d.last - d.first) / 1000), d.persist ? 1 : 0, d.rotated ? 1 : 0,
+    d.hasPos ? 1 : 0, d.hasPos ? d.lat : 0, d.hasPos ? d.lon : 0, d.detail);
   sendLine(line);
 }
 
@@ -879,18 +902,54 @@ static void alertSound(uint8_t cat, bool persist) {
     M5.Speaker.tone(1800, 120, -1, false);
     return;
   }
+  // A distinct signature per threat class, so the category is recognisable by
+  // ear without looking at the screen.
   switch (cat) {
-    case CAT_FLOCK:
+    case CAT_FLOCK:                         // rising two-tone: fixed ALPR camera
     case CAT_RAVEN:
       M5.Speaker.tone(2000, 70);
       M5.Speaker.tone(2800, 110, -1, false);
       break;
-    case CAT_AXON:
+    case CAT_AXON:                          // double chirp: body cam
       M5.Speaker.tone(2600, 70);
       M5.Speaker.tone(2600, 70, -1, false);
       break;
-    case CAT_DEAUTH:
+    case CAT_TRACKER:                       // soft low-high pair: item tracker
+      M5.Speaker.tone(1200, 90);
+      M5.Speaker.tone(1700, 90, -1, false);
+      break;
+    case CAT_GLASSES:                       // high single: wearable camera
+      M5.Speaker.tone(3200, 120);
+      break;
+    case CAT_DEAUTH:                         // low buzz: active WiFi attack
       M5.Speaker.tone(900, 250);
+      break;
+    case CAT_ROGUE:                          // warble: rogue AP / Pineapple
+      M5.Speaker.tone(1500, 70);
+      M5.Speaker.tone(1050, 70, -1, false);
+      M5.Speaker.tone(1500, 70, -1, false);
+      break;
+    case CAT_ATTACK:                         // fast triple high: Flipper / spam
+      M5.Speaker.tone(3000, 55);
+      M5.Speaker.tone(3000, 55, -1, false);
+      M5.Speaker.tone(3000, 55, -1, false);
+      break;
+    case CAT_SKIMMER:                        // low double: card-skimmer module
+      M5.Speaker.tone(1000, 90);
+      M5.Speaker.tone(1000, 90, -1, false);
+      break;
+    case CAT_CAMERA:                         // mid falling: WiFi camera
+      M5.Speaker.tone(2400, 80);
+      M5.Speaker.tone(1800, 110, -1, false);
+      break;
+    case CAT_DRONE:                          // rising sweep feel: drone
+      M5.Speaker.tone(1600, 60);
+      M5.Speaker.tone(2200, 60, -1, false);
+      M5.Speaker.tone(2800, 90, -1, false);
+      break;
+    case CAT_CANARY:                         // urgent high-low: evil twin / bait
+      M5.Speaker.tone(3400, 90);
+      M5.Speaker.tone(2000, 130, -1, false);
       break;
     default:
       M5.Speaker.tone(1400, 60);
@@ -902,6 +961,26 @@ static int findDev(const Hit& h) {
   for (int i = 0; i < MAX_DEVS; i++)
     if (devs[i].used && devs[i].cat == h.cat && memcmp(devs[i].mac, h.mac, 6) == 0) return i;
   return -1;
+}
+
+// No exact MAC match: look for the same unit under a rotated address. Match on
+// the identity fingerprint, but only when the candidate's current address has
+// gone quiet (its advertising stopped), which is what a rotation looks like;
+// two of the same device advertising at once both stay active and are not
+// merged. Returns its index (caller adopts the new MAC), or -1.
+#define ROTATE_QUIET_MS 4000
+static int findDevRotated(const Hit& h) {
+  if (!h.fp) return -1;
+  uint32_t now = millis();
+  int best = -1;
+  for (int i = 0; i < MAX_DEVS; i++) {
+    Dev& d = devs[i];
+    if (!d.used || d.cat != h.cat || d.fp != h.fp) continue;
+    if (memcmp(d.mac, h.mac, 6) == 0) continue;
+    if (now - d.last < ROTATE_QUIET_MS) continue;          // still active = a twin
+    if (best < 0 || (int32_t)(d.last - devs[best].last) > 0) best = i;
+  }
+  return best;
 }
 
 // Free slot, else the stalest entry, preferring to evict non-threats.
@@ -932,6 +1011,7 @@ static void raise(int idx, bool persist) {
   wake();
   bannerDev = idx;
   bannerConv = -1;
+  bannerConvoy = 0;
   devs[idx].fwdPending = true;
   bannerUntil = millis() + BANNER_MS;
   const Dev& rd = devs[idx];
@@ -951,6 +1031,10 @@ static void handleHit(const Hit& h) {
   bool fresh = false;
   bool upgraded = false;
 
+  if (i < 0) {                                   // same unit under a rotated MAC?
+    i = findDevRotated(h);
+    if (i >= 0) { memcpy(devs[i].mac, h.mac, 6); devs[i].rotated = true; }
+  }
   if (i < 0) {
     i = allocDev();
     Dev& d = devs[i];
@@ -959,6 +1043,7 @@ static void handleHit(const Hit& h) {
     d.id = nextId++;
     d.cat = h.cat; d.method = h.method; d.conf = h.conf;
     memcpy(d.mac, h.mac, 6);
+    d.fp = h.fp;
     d.first = now;
     d.peak = h.rssi;
     d.lastMinute = UINT32_MAX;
@@ -1124,6 +1209,21 @@ static void drawHint(const char* hint) {
 static void drawBanner() {
   canvas.setTextDatum(middle_center);
   char line[48];
+  if (bannerConvoy > 0) {
+    canvas.fillScreen(0xC800);                        // deep red
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setFont(&fonts::FreeSansBold12pt7b);
+    canvas.drawString("CONVOY", 120, 28);
+    canvas.setFont(&fonts::FreeSansBold9pt7b);
+    canvas.drawString("possible team tail", 120, 52);
+    canvas.setFont(&fonts::FreeSans9pt7b);
+    snprintf(line, sizeof(line), "%d units shadowing you", bannerConvoy);
+    canvas.drawString(line, 120, 78);
+    canvas.setFont(&fonts::Font0);
+    canvas.drawString("open Radar to see them", 120, 104);
+    canvas.setTextDatum(top_left);
+    return;
+  }
   if (bannerConv >= 0) {
     const mesh::Conv& c = mesh::conv(bannerConv);
     const mesh::Msg* m = mesh::message(bannerConv, 0);
@@ -1765,7 +1865,7 @@ static void draw() {
   canvas.setFont(&fonts::Font0);
   canvas.setTextDatum(top_left);
   bool banner = millis() < bannerUntil &&
-                (bannerConv >= 0 || (bannerDev >= 0 && devs[bannerDev].used));
+                (bannerConvoy > 0 || bannerConv >= 0 || (bannerDev >= 0 && devs[bannerDev].used));
   if (banner && screen != SCR_TYPE) drawBanner();
   else switch (screen) {
     case SCR_DETECT:   drawDetect(); break;
@@ -1968,6 +2068,13 @@ static void serialCommands() {
       static const uint8_t m[6] = {0x3c, 0x1a, 0x2b, 0x44, 0x55, 0x66};
       pushHit(CAT_DRONE, M_ODID_WIFI, 4, m, -60, 6, "Remote ID (beacon)");
     }
+    else if (!strcmp(cmd, "fakeconvoy")) wantFakeConvoy = true;
+    else if (!strcmp(cmd, "fakerot")) {
+      // same named unit, a new MAC each call: tests MAC-rotation grouping
+      static uint8_t seq = 0;
+      uint8_t m[6] = {0x02, 0x11, 0x22, 0x33, 0x44, (uint8_t)(0x50 + seq++)};
+      pushHit(CAT_AXON, M_BLE_NAME, 3, m, -61, 0, "RotUnit-77");
+    }
     else if (!strcmp(cmd, "fakecanary")) {
       static const uint8_t m[6] = {0x02, 0xca, 0x11, 0x7a, 0xb1, 0x70};
       pushHit(CAT_CANARY, M_CANARY_AP, 4, m, -57, 6, canarySsid[0] ? canarySsid : "my-canary");
@@ -1999,6 +2106,7 @@ static void handleButtons() {
   }
   if (a || b || aHold || bHold) {
     bannerUntil = 0;
+    bannerConvoy = 0;
     bool wasAsleep = asleep;
     wake();
     if (wasAsleep) return;                // the first press only wakes the screen
@@ -2192,6 +2300,64 @@ static void autoReport() {
   mesh::send(target, text);
 }
 
+// A device counts toward a convoy if it is a person/vehicle-borne unit (not
+// fixed infrastructure, not an environmental event), seen across 2+ separate
+// minute-windows and still around. Already-"following" units are included.
+static bool convoyCat(uint8_t c) {
+  return !fixedCat(c) && c != CAT_DEAUTH && c != CAT_ROGUE && c != CAT_CANARY;
+}
+static int convoyUnits() {
+  uint32_t now = millis();
+  int n = 0;
+  for (auto& d : devs) {
+    if (!d.used || d.ign || d.known) continue;
+    if (!convoyCat(d.cat)) continue;
+    if (d.minutes < 2 || now - d.last > CONVOY_WINDOW_MS) continue;
+    n++;
+  }
+  return n;
+}
+
+static void raiseConvoy(int n) {
+  uint32_t now = millis();
+  wake();
+  bannerConvoy = n; bannerDev = -1; bannerConv = -1;
+  bannerUntil = now + BANNER_MS + 2000;
+  if (!muted) {                                       // urgent descending triple
+    M5.Speaker.tone(2600, 110);
+    M5.Speaker.tone(2000, 110, -1, false);
+    M5.Speaker.tone(1500, 160, -1, false);
+  }
+  char line[64];
+  snprintf(line, sizeof(line), "{\"t\":\"convoy\",\"n\":%d}", n);
+  sendLine(line);
+
+  if (fwdOn && mesh::state() == mesh::READY) {        // tell the team
+    int target = fwdConvIndex();
+    if (target >= 0) {
+      char text[MESH_TEXT_MAX + 1];
+      int o = snprintf(text, sizeof(text), "[MW] CONVOY: %d units tailing you", n);
+      double la, lo;
+      if (mesh::pos(&la, &lo) && o < (int)sizeof(text) - 26)
+        snprintf(text + o, sizeof(text) - o, " @%.5f,%.5f", la, lo);
+      mesh::send(target, text);
+    }
+  }
+}
+
+// Watch for a coordinated tail: several mobile units that keep recurring around
+// you. No single one need trip "following"; together they do.
+static void convoyCheck() {
+  static uint32_t lastEval = 0, armAt = 0;
+  uint32_t now = millis();
+  if (now - lastEval < 3000) return;                 // cheap, every few seconds
+  lastEval = now;
+  int n = convoyUnits();
+  if (n < CONVOY_MIN || now < armAt) return;
+  armAt = now + CONVOY_COOLDOWN_MS;
+  raiseConvoy(n);
+}
+
 // --------------------------------------------------------------------- main
 void setup() {
   auto cfg = M5.config();
@@ -2333,6 +2499,7 @@ void loop() {
   if (inc >= 0 && mesh::state() == mesh::READY && !(screen == SCR_THREAD && curConv == inc)) {
     wake();
     bannerConv = inc;
+    bannerConvoy = 0;
     const mesh::Msg* nm = mesh::message(inc, 0);
     bannerTeam = nm && strncmp(nm->text, "[MW]", 4) == 0;   // alert from another MeshWatch
     bannerUntil = now + (bannerTeam ? BANNER_MS + 2500 : BANNER_MS);
@@ -2351,6 +2518,7 @@ void loop() {
     forwardAlerts();
     autoReport();
   }
+  convoyCheck();
 
   if (wantClear) {
     wantClear = false;
@@ -2385,6 +2553,30 @@ void loop() {
       d.lastEmit = now;
       emitDev(d, "persist");
     }
+  }
+  if (wantFakeConvoy) {
+    wantFakeConvoy = false;
+    // synthesise three distinct mobile units recurring around you
+    static const uint8_t cats[3] = {CAT_TRACKER, CAT_AXON, CAT_GLASSES};
+    int made = 0;
+    for (int u = 0; u < 3; u++) {
+      int i = -1;
+      for (int k = 0; k < MAX_DEVS; k++) if (!devs[k].used) { i = k; break; }
+      if (i < 0) break;
+      Dev& d = devs[i];
+      memset(&d, 0, sizeof(d));
+      d.used = true; d.id = nextId++;
+      d.cat = cats[u]; d.method = M_BLE_MFG; d.conf = 3;
+      uint8_t m[6] = {0x02, 0xc0, 0x17, 0x00, 0x00, (uint8_t)(0xa0 + u)};
+      memcpy(d.mac, m, 6);
+      d.rssi = d.peak = -60 - u * 4; d.ch = 0;
+      d.first = now - 240000; d.last = now;
+      d.minutes = 3; d.lastMinute = now / 60000;
+      d.count = 20;
+      made++;
+    }
+    int n = convoyUnits();
+    if (made && n >= CONVOY_MIN) raiseConvoy(n);
   }
   if (wantCanary) { wantCanary = false; setCanary(canaryPending); }
   if (now - lastStatus >= STATUS_EMIT_MS) {

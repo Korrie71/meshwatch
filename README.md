@@ -34,7 +34,7 @@ pio run -t upload
 ### Flash the prebuilt binary manually
 
 ```sh
-esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v1.7.0-8MB.bin
+esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v1.8.0-8MB.bin
 ```
 
 
@@ -76,6 +76,26 @@ quiet listing. There are two paths:
   cams and smart glasses (4 min) — seen across that many separate minute-windows
   is flagged as following. Fixed infrastructure (Flock, WiFi cameras, Raven) is
   never called "following" on time alone, so walking past them does not alarm.
+
+**Convoy / hand-off detection**: a real surveillance team rotates units so no
+single device lingers long enough to trip "following". MeshWatch also watches the
+*set* of mobile units around you — trackers, body cams, smart glasses, attack
+tools, drones — and raises a red **CONVOY** banner (with its own urgent tone, and
+a mesh alert to your team if forwarding is on) when three or more of them have
+each recurred across 2+ minute-windows and are still in range. It names the count
+and points you to the Radar. Catches a coordinated tail that per-device logic
+misses.
+
+**MAC-rotation grouping**: modern BLE devices randomise their address every few
+minutes, which would otherwise reset the "following" counters and inflate device
+counts. A named unit that rotates its MAC is recognised as the same device (by a
+fingerprint of its advertised name) once its old address goes quiet, so
+persistence and the radar stay accurate; such a device is marked as having
+rotated. Deliberately anonymous trackers (Apple Find My) rotate their whole
+payload by design and remain ungroupable.
+
+Each threat class also has its **own alert tone**, so you can tell a camera from a
+tracker from a Flipper from an evil-twin canary by ear, without looking.
 
 ### Messaging from the stick (no phone)
 
