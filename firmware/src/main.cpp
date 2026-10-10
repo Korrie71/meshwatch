@@ -21,7 +21,7 @@
 #include "signatures.h"
 #include "mesh.h"
 
-#define FW_VERSION "2.1.1"
+#define FW_VERSION "2.1.2"
 
 // ------------------------------------------------------------------- config
 #define CHANNEL_DWELL_MS   250
@@ -63,7 +63,7 @@ struct Dev {
   uint8_t  mac[6];
   int8_t   rssi, peak;
   bool     persist, fwdPending, known, isNew, hasPos, ign, hadFirstPos, rotated;
-  float    lat, lon, firstLat, firstLon, movedM;
+  float    lat, lon, firstLat, firstLon, movedM, rdrR;   // rdrR: eased radar radius
   uint16_t id, minutes, fp;
   uint32_t first, last, lastEmit, lastMinute, lastFwd, count;
   char     detail[48];
@@ -1059,11 +1059,13 @@ static int allocDev() {
   return victim;
 }
 
+static uint32_t wakeFadeStart = 0;   // non-zero while the display fades back in
 static void wake() {
   lastInput = millis();
   if (asleep) {
     asleep = false;
-    M5.Display.setBrightness(brightness);
+    M5.Display.setBrightness(0);
+    wakeFadeStart = millis();         // ramp brightness up over a few frames
   }
 }
 
@@ -1235,6 +1237,17 @@ static void drawHeader(const char* title) {
   char t[22];
   strlcpy(t, title, sizeof(t));
   canvas.drawString(t, 4, 3);
+
+  // live-scan pulse: a small dot after the title that breathes while scanning,
+  // so even an idle screen reads as alive. Hidden in stealth (no active scan).
+  if (!stealthOn) {
+    int dx = 4 + canvas.textWidth(t) + 6;
+    if (dx < 128) {
+      float ph = (sinf(millis() / 420.0f) + 1) * 0.5f;    // 0..1
+      uint8_t g = 24 + (uint8_t)(ph * 38);                // ramp green channel
+      canvas.fillCircle(dx, 6, ph > 0.5f ? 2 : 1, (uint16_t)(g << 5));
+    }
+  }
 
   mesh::State ms = mesh::state();
   canvas.setTextColor(ms == mesh::READY ? COL_OK : ms == mesh::PAIR_FAILED ? COL_BAD : COL_DIM);
@@ -1904,23 +1917,30 @@ static void drawRadar() {
   for (int r = R; r > 0; r -= R / 3) canvas.drawCircle(cx, cy, r, 0x18E3);
   canvas.drawFastHLine(cx - R, cy, 2 * R, 0x18E3);
   canvas.drawFastVLine(cx, cy - R, 2 * R, 0x18E3);
-  // sweep
+  // sweep, with a short fading trail behind the leading edge
   float sweep = (now % 3000) / 3000.0f * 6.2832f;
-  canvas.drawLine(cx, cy, cx + cosf(sweep) * R, cy + sinf(sweep) * R, 0x3DEA);
+  for (int t = 0; t < 6; t++) {
+    float a = sweep - t * 0.09f;
+    uint16_t shade = t == 0 ? 0x3DEA : t < 3 ? 0x2B4A : 0x1949;
+    canvas.drawLine(cx, cy, cx + cosf(a) * R, cy + sinf(a) * R, shade);
+  }
 
   int live = 0, strongest = -1;
+  float pulse = 3.5f + 1.5f * sinf(now / 260.0f);        // smooth threat-ring pulse
   for (int i = 0; i < MAX_DEVS; i++) {
-    const Dev& d = devs[i];
+    Dev& d = devs[i];
     if (!d.used || now - d.last > ACTIVE_MS) continue;
     if (!(scanMask & (1 << d.cat))) continue;
     live++;
     if (strongest < 0 || d.rssi > devs[strongest].rssi) strongest = i;
     float ang = (macHash(d.mac) % 360) * 0.01745f;
     float rad = R * (1.0f - constrain((d.rssi + 95) / 60.0f, 0.0f, 1.0f));
-    int x = cx + cosf(ang) * rad, y = cy + sinf(ang) * rad;
+    if (d.rdrR <= 0.1f) d.rdrR = rad;                    // first sight: place directly
+    else d.rdrR += (rad - d.rdrR) * 0.2f;                // otherwise glide to new distance
+    int x = cx + cosf(ang) * d.rdrR, y = cy + sinf(ang) * d.rdrR;
     uint16_t c = d.ign ? COL_FAINT : catColor(d.cat);
     canvas.fillCircle(x, y, isThreat(d.cat) ? 3 : 2, c);
-    if (isThreat(d.cat) && !d.ign && (now / 400) % 2) canvas.drawCircle(x, y, 5, c);
+    if (isThreat(d.cat) && !d.ign) canvas.drawCircle(x, y, (int)pulse, c);
   }
   canvas.fillCircle(cx, cy, 2, COL_OK);
 
@@ -2870,11 +2890,18 @@ void loop() {
     lastStatus = now;
     emitStatus();
   }
+  // Fade the backlight up after a wake, over ~260 ms.
+  if (wakeFadeStart) {
+    uint32_t el = now - wakeFadeStart;
+    if (el >= 260) { M5.Display.setBrightness(brightness); wakeFadeStart = 0; }
+    else M5.Display.setBrightness((uint8_t)((uint32_t)brightness * el / 260));
+  }
+
   // Redraw fast (~30 fps) for anything that is animating — the radar sweep, the
-  // type/track screens, a live banner, or a sliding list highlight — and slowly
-  // otherwise to save power.
+  // type/track screens, a live banner, a sliding list highlight, or a wake fade
+  // — and slowly otherwise to save power.
   bool animated = screen == SCR_TYPE || screen == SCR_TRACK || screen == SCR_RADAR ||
-                  screen == SCR_SUMMARY || now < bannerUntil || uiAnimating;
+                  screen == SCR_SUMMARY || now < bannerUntil || uiAnimating || wakeFadeStart;
   if (!asleep && now - lastDraw >= (animated ? 33u : 110u)) {
     lastDraw = now;
     draw();

@@ -34,7 +34,7 @@ pio run -t upload
 ### Flash the prebuilt binary manually
 
 ```sh
-esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v2.1.1-8MB.bin
+esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v2.1.2-8MB.bin
 ```
 
 
@@ -187,6 +187,10 @@ Other features:
   tap a button to skip it.
 - **Battery icon**: the header shows a colour-coded battery (green / amber / red,
   with a charge tick on USB power) instead of a bare percentage.
+- **Smooth motion**: the list highlight slides toward the selected row, the radar
+  sweep has a fading trail and its blips glide to new distances, a small green
+  "scanning" dot breathes in the header, and the screen fades in on wake. The UI
+  runs at ~30 fps while animating and idles slowly to save power.
 
 Debugging over USB serial: `firmware/shot.py` presses buttons and saves
 screenshots; the firmware also prints pairing diagnostics as JSON lines.
