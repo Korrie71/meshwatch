@@ -20,6 +20,7 @@ const CATS = [
   { key: "skimmer", name: "Skimmer" },
   { key: "camera", name: "Cameras" },
   { key: "drone", name: "Drones" },
+  { key: "canary", name: "Canary" },
 ];
 const ACTIVE_MS = 60000;
 const MAX_MSGS = 300;
@@ -376,7 +377,6 @@ async function connectDetector() {
     det.device = device;
     setLink("detLink", "on", device.name || "connected");
     await detCmd("list");
-    await detCmd("evlog");
   } catch (e) {
     det.device = null;
     setLink("detLink", "off", "connect");
@@ -422,17 +422,6 @@ function onDetEvent(ev) {
     $("muteOn").checked = !!ev.mute;
     return renderDetections();
   }
-  if (ev.t === "ev") {
-    const key = ev.cat + "|" + ev.mac;
-    const r = log[key] || (log[key] = { cat: ev.cat, mac: ev.mac, first: ev.epoch ? ev.epoch * 1000 : Date.now() });
-    r.lbl = r.lbl || CATS.find((c) => c.key === ev.cat)?.name || ev.cat;
-    r.m = ev.m; r.conf = Math.max(ev.conf, r.conf || 0); r.pk = Math.max(ev.pk, r.pk ?? -127);
-    r.logged = true;
-    if (!r.last) r.last = r.first;
-    save("log", log);
-    return renderDetections();
-  }
-  if (ev.t === "evend") return;
   if (ev.t !== "det") return;
   const key = ev.cat + "|" + ev.mac;
   const last = Date.now() - ev.age * 1000;
@@ -596,6 +585,22 @@ $("fwdCool").value = cfg.fwdCool;
 $("fwdCool").addEventListener("change", (e) => { cfg.fwdCool = Math.max(1, Number(e.target.value) || 10); saveCfg(); });
 $("fwdTo").addEventListener("change", (e) => { cfg.fwdTo = e.target.value; saveCfg(); });
 $("muteOn").addEventListener("change", (e) => detCmd(e.target.checked ? "mute 1" : "mute 0"));
+
+$("canarySsid").value = cfg.canary || "";
+$("canarySet").addEventListener("click", async () => {
+  const name = $("canarySsid").value.trim();
+  if (!name) return toast("Enter a bait name first", true);
+  if (!det.rx) return toast("Connect the detector first", true);
+  cfg.canary = name; saveCfg();
+  await detCmd("canary " + name);
+  toast("Canary armed: " + name);
+});
+$("canaryClear").addEventListener("click", async () => {
+  cfg.canary = ""; saveCfg();
+  $("canarySsid").value = "";
+  await detCmd("canary");
+  toast("Canary disarmed");
+});
 
 $("exportLog").addEventListener("click", async () => {
   try {

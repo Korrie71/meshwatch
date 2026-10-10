@@ -34,7 +34,7 @@ pio run -t upload
 ### Flash the prebuilt binary manually
 
 ```sh
-esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v1.6.0-8MB.bin
+esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v1.7.0-8MB.bin
 ```
 
 
@@ -58,6 +58,7 @@ esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v1.6.0-8MB.bi
 | Drones | Open Drone ID / Remote ID over WiFi (NAN frames, beacon vendor IE) and BLE (service data 0xFFFA) |
 | Pwnagotchi | WiFi beacon whose SSID is a JSON blob containing "pwnd_tot" (listed under Attack tools) |
 | Meshtastic radios | BLE 128-bit service UUID 6ba1b218-... (listed under MeshCore/mesh radios) |
+| Canary SSID | a bait network name you arm: an AP beaconing it (evil twin) or a client probing for it raises a Canary alert |
 
 Confidence runs 0-4. Confidence 3+ sounds the speaker and raises a banner.
 Several Flock OUIs are shared with consumer hardware, so a bare OUI match is
@@ -107,16 +108,21 @@ Blue-team features:
 - **Baseline watch** (MENU): learn the devices in a trusted place for 60 s, then
   get alerted on anything new to the area, whatever its type. Good for sweeping
   a room or car.
-- **Evidence log**: every alert is written to flash with the radio's timestamp,
-  so findings survive a reboot. Export or clear it from the app, or over USB with
-  `evlog` / `evclear`.
+- **Canary SSID**: arm a bait network name (from the app's Settings, or over USB
+  with `canary <ssid>`). The detector then watches every beacon, probe response
+  and probe request for that exact name. An AP advertising it is an **evil twin**
+  impersonating your network (confidence 4); a client asking for it is a device
+  that has the bait saved (confidence 3). Set it to a network you control and
+  sweep for impostors in the field, or to a unique name that should exist
+  nowhere as a pure honeytoken. Toggle it on/off in SETTINGS. Note: near the real
+  network of the same name it will match that AP, so it is a field tool.
 - **Team alerts**: an incoming mesh message starting with `[MW]` (what this
   firmware and the app send when forwarding) is shown as a red TEAM ALERT banner
   with the threat tone, not a quiet chat line.
 - **Geotagging**: when the radio reports a GPS/advert position (e.g. a Wio
-  Tracker), every detection and evidence-log entry is stamped with latitude and
-  longitude, and forwarded alerts carry coordinates. This also makes the
-  "tracker following you" test far more reliable.
+  Tracker), every detection is stamped with latitude and longitude, and forwarded
+  alerts carry coordinates. This also drives the GPS path of "Following you"
+  detection.
 - **Auto-report to mesh** (SETTINGS): every 5 minutes, sends a one-line summary
   of what is in range (counts per threat category, plus position) to the forward
   channel, so a team or base station keeps a picture hands-free.
@@ -125,8 +131,8 @@ Blue-team features:
   and ticks faster as you approach.
 - **Device lock** (SETTINGS): an optional 6-digit unlock code asked at boot. A
   separate **duress wipe code** unlocks too but first erases the saved radio
-  pairing, evidence log and baseline. USB `lockoff` clears the lock so you can
-  never be locked out permanently.
+  pairing and baseline. USB `lockoff` clears the lock so you can never be locked
+  out permanently.
 
 Not possible on this hardware, so not attempted: 5 GHz WiFi, classic Bluetooth,
 cellular/IMSI-catcher detection, and offline (non-transmitting) cameras. IR
@@ -147,9 +153,6 @@ Other features:
 - **Radar** (MENU): a live sweep showing every in-range detection placed by
   signal strength (distance from centre) and a stable per-device angle, coloured
   by category; names the closest one.
-- **Evidence log viewer** (MENU): browse the flash-stored alert log on the
-  device, newest first, with timestamp, category, MAC, confidence and signal;
-  hold A to clear.
 - **Silence a device**: in the Signal finder, hold A to permanently ignore a
   device (e.g. your own gear). Ignored devices never alert and are listed muted;
   clear the list from Settings.

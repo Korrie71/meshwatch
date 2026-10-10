@@ -18,16 +18,17 @@ enum Cat : uint8_t {
   CAT_SKIMMER,     // BLE serial modules used in card skimmers (HC-05...)
   CAT_CAMERA,      // consumer / CCTV WiFi cameras (Hikvision, Ring, Wyze...)
   CAT_DRONE,       // drones broadcasting Remote ID (WiFi or BLE)
+  CAT_CANARY,      // canary SSID: someone probing for or spoofing your bait name
   CAT_COUNT
 };
 
 static const char* const CAT_KEY[CAT_COUNT] = {
   "flock", "raven", "axon", "tracker", "glasses", "deauth", "beacon", "meshcore",
-  "rogueap", "attack", "skimmer", "camera", "drone"
+  "rogueap", "attack", "skimmer", "camera", "drone", "canary"
 };
 static const char* const CAT_SHORT[CAT_COUNT] = {
   "FLOCK", "RAVEN", "AXON", "TRACK", "GLASS", "DEAUTH", "BEACON", "MESH", "ROGUE",
-  "ATTACK", "SKIM", "CAM", "DRONE"
+  "ATTACK", "SKIM", "CAM", "DRONE", "CANARY"
 };
 
 enum Method : uint8_t {
@@ -35,7 +36,8 @@ enum Method : uint8_t {
   M_BLE_NAME, M_BLE_MFG, M_BLE_SVC, M_BLE_OUI,
   M_IBEACON, M_EDDYSTONE, M_FINDMY, M_TILE, M_SMARTTAG, M_CHIPOLO, M_FMDN,
   M_DEAUTH, M_KARMA, M_BLE_SPAM, M_FLIPPER, M_SKIMMER,
-  M_PWNAGOTCHI, M_MESHTASTIC, M_CAM_OUI, M_CAM_SSID, M_ODID_WIFI, M_ODID_BLE, M_COUNT
+  M_PWNAGOTCHI, M_MESHTASTIC, M_CAM_OUI, M_CAM_SSID, M_ODID_WIFI, M_ODID_BLE,
+  M_CANARY_AP, M_CANARY_PROBE, M_COUNT
 };
 
 static const char* const METHOD_KEY[M_COUNT] = {
@@ -43,7 +45,8 @@ static const char* const METHOD_KEY[M_COUNT] = {
   "ble_name", "ble_mfg", "ble_svc", "ble_oui",
   "ibeacon", "eddystone", "findmy", "tile", "smarttag", "chipolo", "fmdn",
   "deauth", "karma_ssid_flood", "ble_advert_spam", "flipper_zero", "bt_serial_module",
-  "pwnagotchi", "meshtastic", "camera_oui", "camera_ssid", "remoteid_wifi", "remoteid_ble"
+  "pwnagotchi", "meshtastic", "camera_oui", "camera_ssid", "remoteid_wifi", "remoteid_ble",
+  "canary_evil_twin", "canary_probe"
 };
 
 // Confidence 0-4. CONF_ALERT and up makes noise and raises the banner; lower

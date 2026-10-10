@@ -12,7 +12,7 @@
     --text: #e6edf2; --dim: #8496a3; --faint: #55646f;
     --accent: #3ddc97; --accent-ink: #04130c; --danger: #ff5d5d;
     --flock: #ff5d5d; --raven: #ff9140; --axon: #ffce3d; --tracker: #b78cff;
-    --glasses: #45cfee; --deauth: #ff6fb1; --beacon: #8496a3; --meshcore: #3ddc97; --rogueap: #ffd21f; --attack: #ff2d2d; --skimmer: #ff6a2d; --camera: #ff8a7a; --drone: #6aa0ff;
+    --glasses: #45cfee; --deauth: #ff6fb1; --beacon: #8496a3; --meshcore: #3ddc97; --rogueap: #ffd21f; --attack: #ff2d2d; --skimmer: #ff6a2d; --camera: #ff8a7a; --drone: #6aa0ff; --canary: #ff5df0;
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
@@ -221,6 +221,12 @@
         <div class="row"><label for="muteOn">Mute the detector's speaker</label><input type="checkbox" id="muteOn"></div>
         <div class="row"><label for="vibOn">Vibrate this phone on alerts</label><input type="checkbox" id="vibOn"></div>
         <div class="row"><label>Detection log</label><button class="btn" id="exportLog">Copy as JSON</button><button class="btn" id="clearLog">Clear</button></div>
+      </div>
+      <div class="card">
+        <h2>Canary SSID</h2>
+        <p>A bait network name. The detector raises a <b>Canary</b> alert if anything nearby beacons it (an evil twin spoofing that network) or probes for it. Set it to a network you control and watch for impostors in the field, or to a unique name that should exist nowhere.</p>
+        <div class="row"><label for="canarySsid">Bait name</label><input type="text" id="canarySsid" maxlength="32" placeholder="e.g. FRITZ-Box-7590" style="width:170px"></div>
+        <div class="row"><label></label><button class="btn" id="canarySet">Arm</button><button class="btn" id="canaryClear">Disarm</button></div>
       </div>
       <div class="card">
         <h2>Message history</h2>

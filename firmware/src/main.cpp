@@ -21,7 +21,7 @@
 #include "signatures.h"
 #include "mesh.h"
 
-#define FW_VERSION "1.6.0"
+#define FW_VERSION "1.7.0"
 
 // ------------------------------------------------------------------- config
 #define CHANNEL_DWELL_MS   250
@@ -74,6 +74,10 @@ static QueueHandle_t hitQ;
 
 static bool muted = false;
 static uint16_t scanMask = SCAN_ALL;  // bit per Cat: what to scan for (needs >8 bits)
+// Canary SSID: a bait network name. If anything nearby beacons it (an evil twin
+// spoofing your network) or probes for it, raise a CAT_CANARY alert.
+static char canarySsid[33] = "";
+static bool canaryOn = false;
 static uint8_t curChannel = 1;
 static volatile uint32_t deauthCount = 0;
 static uint8_t deauthBssid[6];
@@ -89,18 +93,9 @@ static NimBLECharacteristic* txChr = nullptr;
 static volatile bool appConnected = false;
 static volatile bool wantList = false;
 static volatile bool wantClear = false;
-static volatile bool wantEvlog = false;
-static volatile bool wantEvclear = false;
 static volatile bool wantFakeFollow = false;
-
-// Evidence log: a compact, flash-backed ring of alerts, oldest first. It
-// survives reboots, so a sweep's findings are not lost with power.
-struct LogEvt { uint8_t cat, method, conf; int8_t rssi; uint8_t mac[6]; uint32_t epoch; float lat, lon; };
-#define EVLOG_MAX 64
-static LogEvt evlog[EVLOG_MAX];
-static uint8_t evUsed = 0;
-static bool evDirty = false;
-static uint32_t evLastFlush = 0;
+static volatile bool wantCanary = false;
+static char canaryPending[33] = "";
 static volatile uint16_t appMtu = 23;
 
 static M5Canvas canvas(&M5.Display);
@@ -194,7 +189,8 @@ static float distM(float la1, float lo1, float la2, float lo2) {
 static bool mobileCat(uint8_t c) { return c == CAT_TRACKER || c == CAT_AXON || c == CAT_GLASSES; }
 // Fixed infrastructure / noise that should never be called "following".
 static bool fixedCat(uint8_t c) {
-  return c == CAT_BEACON || c == CAT_MESH || c == CAT_FLOCK || c == CAT_CAMERA || c == CAT_RAVEN;
+  return c == CAT_BEACON || c == CAT_MESH || c == CAT_FLOCK || c == CAT_CAMERA ||
+         c == CAT_RAVEN || c == CAT_CANARY;
 }
 // Decide whether a device has become a "following you" case.
 static bool isFollowing(const Dev& d) {
@@ -223,6 +219,7 @@ static uint16_t catColor(uint8_t cat) {
     case CAT_SKIMMER: return 0xFD24;  // orange-red
     case CAT_CAMERA:  return 0xFB2C;  // salmon
     case CAT_DRONE:   return 0x5D1F;  // blue
+    case CAT_CANARY:  return 0xF81F;  // magenta
     default:          return 0x8C71;  // grey
   }
 }
@@ -242,6 +239,7 @@ static const char* labelFor(uint8_t cat, uint8_t method) {
     case CAT_SKIMMER: return "Card-skimmer BT module";
     case CAT_CAMERA:  return "WiFi camera";
     case CAT_DRONE:   return method == M_ODID_BLE ? "Drone (Remote ID, BLE)" : "Drone (Remote ID)";
+    case CAT_CANARY:  return method == M_CANARY_AP ? "Canary: evil twin AP" : "Canary: someone probing";
     case CAT_TRACKER:
       switch (method) {
         case M_FINDMY:   return "Find My tracker";
@@ -417,6 +415,30 @@ static void checkCameraSsid(const uint8_t* ssid, int slen, const uint8_t* mac, i
   if (cameraName(name)) wifiHit(CAT_CAMERA, M_CAM_SSID, 3, mac, rssi, name);
 }
 
+// Canary SSID: the user plants a bait network name. An AP beaconing it (subtype
+// 8) or answering probes with it (5) is an evil twin impersonating that network;
+// a client probing for it (4) is a device that has the bait saved. Exact match.
+static void checkCanary(const uint8_t* ssid, int slen, const uint8_t* mac, int8_t rssi,
+                        uint8_t subtype) {
+  if (!canaryOn || !canarySsid[0]) return;
+  if (slen <= 0 || slen > 32 || slen != (int)strlen(canarySsid)) return;
+  if (memcmp(ssid, canarySsid, slen) != 0) return;
+  if (subtype == 8 || subtype == 5)
+    wifiHit(CAT_CANARY, M_CANARY_AP, 4, mac, rssi, canarySsid);
+  else
+    wifiHit(CAT_CANARY, M_CANARY_PROBE, 3, mac, rssi, canarySsid);
+}
+
+// Set (and persist) the bait SSID. Empty string clears and disarms it.
+static void setCanary(const char* s) {
+  char clean[33];
+  sanitize(clean, sizeof(clean), (const uint8_t*)s, strlen(s));
+  strlcpy(canarySsid, clean, sizeof(canarySsid));
+  canaryOn = canarySsid[0] != '\0';
+  uiPrefs.putString("canssid", canarySsid);
+  uiPrefs.putBool("canon", canaryOn);
+}
+
 // Pwnagotchi beacons a JSON SSID (can exceed 32 bytes) carrying "pwnd_tot".
 static void checkPwnagotchi(const uint8_t* ssid, int slen, const uint8_t* mac, int8_t rssi) {
   if (slen < 8 || slen > 230 || ssid[0] != '{') return;
@@ -515,6 +537,7 @@ static void wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
       int slen = findSsid(p + off, len - off, &ssid);
       checkSsid(ssid, slen, addr2, rssi);
       checkCameraSsid(ssid, slen, addr2, rssi);
+      checkCanary(ssid, slen, addr2, rssi, subtype);
       if (subtype == 8) {
         trackKarma(addr2, ssid, slen, rssi);
         checkPwnagotchi(ssid, slen, addr2, rssi);
@@ -743,12 +766,12 @@ class ServerCB : public NimBLEServerCallbacks {
 class RxCB : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c) override {
     std::string v = c->getValue();
-    if (v.rfind("evlog", 0) == 0) wantEvlog = true;
-    else if (v.rfind("evclear", 0) == 0) wantEvclear = true;
-    else if (v.rfind("list", 0) == 0) wantList = true;
+    if (v.rfind("list", 0) == 0) wantList = true;
     else if (v.rfind("clear", 0) == 0) wantClear = true;
     else if (v.rfind("mute 1", 0) == 0) muted = true;
     else if (v.rfind("mute 0", 0) == 0) muted = false;
+    else if (v.rfind("canary ", 0) == 0) { strlcpy(canaryPending, v.c_str() + 7, sizeof(canaryPending)); wantCanary = true; }
+    else if (v == "canary") { canaryPending[0] = '\0'; wantCanary = true; }
   }
 };
 
@@ -905,21 +928,6 @@ static void wake() {
   }
 }
 
-static void logEvent(const Dev& d) {
-  LogEvt e;
-  e.cat = d.cat; e.method = d.method; e.conf = d.conf; e.rssi = d.peak;
-  memcpy(e.mac, d.mac, 6);
-  e.epoch = mesh::epoch();
-  e.lat = d.hasPos ? d.lat : 0;
-  e.lon = d.hasPos ? d.lon : 0;
-  if (evUsed == EVLOG_MAX) {
-    memmove(evlog, evlog + 1, sizeof(LogEvt) * (EVLOG_MAX - 1));
-    evUsed--;
-  }
-  evlog[evUsed++] = e;
-  evDirty = true;
-}
-
 static void raise(int idx, bool persist) {
   wake();
   bannerDev = idx;
@@ -934,22 +942,6 @@ static void raise(int idx, bool persist) {
   } else {
     alertSound(rd.cat, persist);
   }
-  logEvent(devs[idx]);
-}
-
-static void emitEvlog() {
-  char line[200];
-  for (uint8_t i = 0; i < evUsed; i++) {
-    const LogEvt& e = evlog[i];
-    snprintf(line, sizeof(line),
-      "{\"t\":\"ev\",\"cat\":\"%s\",\"m\":\"%s\",\"conf\":%u,\"pk\":%d,"
-      "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"epoch\":%lu,\"lat\":%.6f,\"lon\":%.6f}",
-      CAT_KEY[e.cat < CAT_COUNT ? e.cat : 0], METHOD_KEY[e.method < M_COUNT ? e.method : 0],
-      e.conf, e.rssi, e.mac[0], e.mac[1], e.mac[2], e.mac[3], e.mac[4], e.mac[5],
-      (unsigned long)e.epoch, e.lat, e.lon);
-    sendLine(line);
-  }
-  sendLine("{\"t\":\"evend\"}");
 }
 
 static void handleHit(const Hit& h) {
@@ -1038,7 +1030,7 @@ static void handleHit(const Hit& h) {
 }
 
 // ----------------------------------------------------------------------- UI
-enum Screen : uint8_t { SCR_DETECT, SCR_MESH, SCR_THREAD, SCR_COMPOSE, SCR_TYPE, SCR_SETTINGS, SCR_PICK, SCR_SCAN, SCR_FIND, SCR_TRACK, SCR_BASELINE, SCR_RADAR, SCR_EVLOG };
+enum Screen : uint8_t { SCR_DETECT, SCR_MESH, SCR_THREAD, SCR_COMPOSE, SCR_TYPE, SCR_SETTINGS, SCR_PICK, SCR_SCAN, SCR_FIND, SCR_TRACK, SCR_BASELINE, SCR_RADAR };
 static Screen screen = SCR_DETECT;
 static int sel = 0;                 // cursor in the current list
 static int curConv = -1;
@@ -1062,8 +1054,8 @@ static uint8_t typePurpose = TYPE_MSG;
 static bool typingPin = false;
 
 // Device lock: an optional unlock code. A separate duress code unlocks too but
-// first wipes the radio pairing, evidence log and baseline. Off by default; a
-// USB "lockoff" command clears it, so the device can never be locked for good.
+// first wipes the radio pairing and baseline. Off by default; a USB "lockoff"
+// command clears it, so the device can never be locked for good.
 static bool lockOn = false;
 static uint32_t lockPin = 0, duressPin = 0;
 static bool locked = false;
@@ -1383,7 +1375,7 @@ static void drawType() {
   drawHint("A pick, hold: del   B next, hold: fast");
 }
 
-#define SETTING_COUNT 14
+#define SETTING_COUNT 15
 static void drawSettings() {
   drawHeader("SETTINGS");
   drawRows(SETTING_COUNT, 19, 8, [&](int i, char* left, char* right, uint16_t* col) {
@@ -1465,6 +1457,12 @@ static void drawSettings() {
         strlcpy(left, "Silenced devices", 40);
         snprintf(right, 16, ignCount ? "%u - clear" : "none", ignCount);
         break;
+      case 14:
+        strlcpy(left, "Canary SSID", 40);
+        if (!canarySsid[0]) strlcpy(right, "set in app", 16);
+        else { strlcpy(right, canaryOn ? canarySsid : "off", 16); }
+        if (canaryOn && canarySsid[0]) *col = COL_MINE;
+        break;
     }
   });
   drawHint(sel == 0 ? "A choose radio   hold A: forget" : "A change   B next   hold B: detect");
@@ -1474,11 +1472,11 @@ static const char* const SCAN_NAME[CAT_COUNT] = {
   "Flock cameras", "Raven gunshot sensors", "Axon body cams / Tasers", "Trackers (AirTag, Tile...)",
   "Smart glasses", "WiFi deauth attacks", "Beacons (iBeacon...)", "MeshCore radios nearby",
   "Rogue access points", "Attack tools (Flipper...)", "Card skimmers (HC-05...)",
-  "WiFi cameras (Ring/Wyze...)", "Drones (Remote ID)",
+  "WiFi cameras (Ring/Wyze...)", "Drones (Remote ID)", "Canary SSID (your bait name)",
 };
 
 // Rows 0-1 are apps, row 2 is "Scan all", rows 3.. are the categories.
-#define MENU_APPS 5
+#define MENU_APPS 4
 #define MENU_ROWS (CAT_COUNT + 1 + MENU_APPS)
 static void drawScan() {
   drawHeader("MENU");
@@ -1510,12 +1508,6 @@ static void drawScan() {
       int n = 0;
       for (auto& d : devs) if (d.used && millis() - d.last < ACTIVE_MS) n++;
       snprintf(right, 16, "%d live", n);
-      *col = COL_OK;
-      return;
-    }
-    if (i == 4) {
-      strlcpy(left, " >  Evidence log", 40);
-      snprintf(right, 16, "%u saved", evUsed);
       *col = COL_OK;
       return;
     }
@@ -1750,30 +1742,6 @@ static void drawRadar() {
   drawHint("B refresh   hold B: back");
 }
 
-static void drawEvlog() {
-  drawHeader("EVIDENCE LOG");
-  if (evUsed == 0) {
-    canvas.setTextColor(COL_FAINT);
-    canvas.drawCentreString("no alerts logged yet", 120, 60);
-    drawHint("hold B: back");
-    return;
-  }
-  // newest first
-  drawRows(evUsed, 19, 8, [&](int i, char* left, char* right, uint16_t* col) {
-    const LogEvt& e = evlog[evUsed - 1 - i];
-    char when[12] = "--:--";
-    if (e.epoch) {
-      time_t t = e.epoch; struct tm tm; localtime_r(&t, &tm);
-      snprintf(when, sizeof(when), "%02d:%02d", tm.tm_hour, tm.tm_min);
-    }
-    snprintf(left, 40, "%s %-5s %02x%02x%02x", when, CAT_SHORT[e.cat < CAT_COUNT ? e.cat : 0],
-             e.mac[3], e.mac[4], e.mac[5]);
-    snprintf(right, 16, "c%u %d", e.conf, e.rssi);
-    *col = catColor(e.cat < CAT_COUNT ? e.cat : 0);
-  });
-  drawHint("B scroll   hold A: clear   hold B: back");
-}
-
 static void drawPick() {
   drawHeader("CHOOSE RADIO");
   mesh::Radio list[6];
@@ -1812,7 +1780,6 @@ static void draw() {
     case SCR_TRACK:    drawTrack(); break;
     case SCR_BASELINE: drawBaseline(); break;
     case SCR_RADAR:    drawRadar(); break;
-    case SCR_EVLOG:    drawEvlog(); break;
   }
   canvas.pushSprite(0, 0);
 }
@@ -1834,8 +1801,6 @@ static void startTyping(uint8_t purpose) {
 
 static void wipeForDuress() {
   mesh::forget();
-  evUsed = 0;
-  uiPrefs.remove("evlog");
   baselineState = BL_OFF;
   blCount = 0;
 }
@@ -1939,6 +1904,12 @@ static void changeSetting(int i) {
       uiPrefs.remove("ign");
       for (auto& d : devs) d.ign = false;
       break;
+    case 14:
+      if (canarySsid[0]) {                 // arm / disarm; set the name from the app
+        canaryOn = !canaryOn;
+        uiPrefs.putBool("canon", canaryOn);
+      }
+      break;
     case 6:
       brightness = brightness >= 250 ? 30 : brightness >= 160 ? 255 : brightness >= 90 ? 160 : 90;
       M5.Display.setBrightness(brightness);
@@ -1949,14 +1920,13 @@ static void changeSetting(int i) {
 
 // USB serial debug commands: "a" / "b" click, "A" / "B" hold, "pick NAME" chooses
 // the radio whose name contains NAME, "pin 123456" sets the radio PIN,
-// "fake" injects a test beacon, "clear" empties the detection list, "evlog"
-// dumps the evidence log, "evclear" wipes it, "lockoff" clears the device
-// lock, "shot" dumps the
-// screen as RGB565 hex.
+// "fake" injects a test beacon, "clear" empties the detection list, "canary
+// <ssid>" arms the canary bait name (bare "canary" clears it), "lockoff" clears
+// the device lock, "shot" dumps the screen as RGB565 hex.
 static bool simA, simB, simAHold, simBHold;
 
 static void serialCommands() {
-  static char cmd[32];
+  static char cmd[64];
   static uint8_t n = 0;
   while (Serial.available()) {
     char c = Serial.read();
@@ -1977,8 +1947,8 @@ static void serialCommands() {
         if (strstr(list[i].name, cmd + 5)) { mesh::choose(list[i].slot); break; }
     }
     else if (!strcmp(cmd, "clear")) wantClear = true;
-    else if (!strcmp(cmd, "evlog")) wantEvlog = true;
-    else if (!strcmp(cmd, "evclear")) wantEvclear = true;
+    else if (!strncmp(cmd, "canary ", 7)) setCanary(cmd + 7);
+    else if (!strcmp(cmd, "canary")) setCanary("");
     else if (!strcmp(cmd, "home")) { screen = SCR_DETECT; sel = 0; }
     else if (!strcmp(cmd, "blescan")) bleDebugUntil = millis() + 25000;
     else if (!strcmp(cmd, "lockoff")) {
@@ -1997,6 +1967,10 @@ static void serialCommands() {
     else if (!strcmp(cmd, "fakedrone")) {
       static const uint8_t m[6] = {0x3c, 0x1a, 0x2b, 0x44, 0x55, 0x66};
       pushHit(CAT_DRONE, M_ODID_WIFI, 4, m, -60, 6, "Remote ID (beacon)");
+    }
+    else if (!strcmp(cmd, "fakecanary")) {
+      static const uint8_t m[6] = {0x02, 0xca, 0x11, 0x7a, 0xb1, 0x70};
+      pushHit(CAT_CANARY, M_CANARY_AP, 4, m, -57, 6, canarySsid[0] ? canarySsid : "my-canary");
     }
     else if (!strcmp(cmd, "fakefollow")) wantFakeFollow = true;
     else if (!strncmp(cmd, "pin ", 4)) mesh::setPin(strtoul(cmd + 4, nullptr, 10));
@@ -2094,7 +2068,6 @@ static void handleButtons() {
         else if (sel == 1) go(SCR_FIND);
         else if (sel == 2) go(SCR_BASELINE);
         else if (sel == 3) go(SCR_RADAR);
-        else if (sel == 4) go(SCR_EVLOG);
         else toggleScan(sel - MENU_APPS);
       }
       if (bHold) go(SCR_DETECT);
@@ -2120,15 +2093,6 @@ static void handleButtons() {
 
     case SCR_RADAR:
       if (bHold) { go(SCR_SCAN); sel = 3; }
-      break;
-
-    case SCR_EVLOG:
-      if (b && evUsed) sel = (sel + 1) % evUsed;
-      if (aHold) {
-        evUsed = 0;
-        uiPrefs.remove("evlog");
-      }
-      if (bHold) { go(SCR_SCAN); sel = 4; }
       break;
 
     case SCR_TRACK:
@@ -2247,6 +2211,8 @@ void setup() {
   stealthOn = uiPrefs.getBool("stealth", false);
   reportOn = uiPrefs.getBool("report", false);
   closeAlarm = uiPrefs.getBool("close", false);
+  uiPrefs.getString("canssid", canarySsid, sizeof(canarySsid));
+  canaryOn = uiPrefs.getBool("canon", false) && canarySsid[0];
   size_t ignBytes = uiPrefs.getBytesLength("ign");
   if (ignBytes && ignBytes <= sizeof(ignHashes) && ignBytes % 2 == 0) {
     uiPrefs.getBytes("ign", ignHashes, ignBytes);
@@ -2255,11 +2221,7 @@ void setup() {
   lockOn = uiPrefs.getBool("lockon", false);
   lockPin = uiPrefs.getUInt("lockpin", 0);
   duressPin = uiPrefs.getUInt("duress", 0);
-  size_t evBytes = uiPrefs.getBytesLength("evlog");
-  if (evBytes && evBytes <= sizeof(evlog) && evBytes % sizeof(LogEvt) == 0) {
-    uiPrefs.getBytes("evlog", evlog, evBytes);
-    evUsed = evBytes / sizeof(LogEvt);
-  }
+  uiPrefs.remove("evlog");   // drop any evidence log saved by older firmware
   setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);   // Belgium; the radio's clock is UTC
   tzset();
   M5.Display.setRotation(1);
@@ -2424,17 +2386,7 @@ void loop() {
       emitDev(d, "persist");
     }
   }
-  if (wantEvlog) { wantEvlog = false; emitEvlog(); }
-  if (wantEvclear) {
-    wantEvclear = false;
-    evUsed = 0;
-    uiPrefs.remove("evlog");
-  }
-  if (evDirty && now - evLastFlush > 8000) {
-    evDirty = false;
-    evLastFlush = now;
-    uiPrefs.putBytes("evlog", evlog, sizeof(LogEvt) * evUsed);
-  }
+  if (wantCanary) { wantCanary = false; setCanary(canaryPending); }
   if (now - lastStatus >= STATUS_EMIT_MS) {
     lastStatus = now;
     emitStatus();
