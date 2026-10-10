@@ -177,3 +177,10 @@ static const uint8_t ODID_NAN_DEST[6] = {0x51, 0x6f, 0x9a, 0x01, 0x00, 0x00};
 // A tracker that stays in range across this many distinct minutes is flagged
 // as persistent (possibly travelling with you).
 #define TRACKER_PERSIST_MINUTES 10
+
+// "Following you" detection for other mobile devices (body cams, smart glasses).
+// Co-present across this many distinct minute-windows -> flagged as following.
+#define FOLLOW_MINUTES 4
+// If the radio reports position: a device that stays in range while you travel
+// at least this far (metres) is flagged as following, whatever its type.
+#define FOLLOW_MOVE_M 120.0f

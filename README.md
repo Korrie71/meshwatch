@@ -34,7 +34,7 @@ pio run -t upload
 ### Flash the prebuilt binary manually
 
 ```sh
-esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v1.5.0-8MB.bin
+esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v1.6.0-8MB.bin
 ```
 
 
@@ -63,6 +63,18 @@ Confidence runs 0-4. Confidence 3+ sounds the speaker and raises a banner.
 Several Flock OUIs are shared with consumer hardware, so a bare OUI match is
 confidence 2 or lower. A tracker in range across 10 separate minutes is flagged
 as persistent.
+
+**"Following you" detection**: any device that stays with you is promoted to a
+dedicated red **FOLLOWING YOU** banner with its own urgent tone, not just a
+quiet listing. There are two paths:
+
+- *GPS path* (strongest, needs a radio that reports position): a non-fixed
+  device that stays in range while you actually travel ~120 m or more is flagged
+  whatever its type. The banner shows how far it shadowed you.
+- *Time path* (no GPS needed): wearable surveillance — trackers (10 min), body
+  cams and smart glasses (4 min) — seen across that many separate minute-windows
+  is flagged as following. Fixed infrastructure (Flock, WiFi cameras, Raven) is
+  never called "following" on time alone, so walking past them does not alarm.
 
 ### Messaging from the stick (no phone)
 

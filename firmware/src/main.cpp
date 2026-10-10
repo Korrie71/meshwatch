@@ -21,7 +21,7 @@
 #include "signatures.h"
 #include "mesh.h"
 
-#define FW_VERSION "1.5.0"
+#define FW_VERSION "1.6.0"
 
 // ------------------------------------------------------------------- config
 #define CHANNEL_DWELL_MS   250
@@ -61,8 +61,8 @@ struct Dev {
   uint8_t  cat, method, conf, ch;
   uint8_t  mac[6];
   int8_t   rssi, peak;
-  bool     persist, fwdPending, known, isNew, hasPos, ign;
-  float    lat, lon;
+  bool     persist, fwdPending, known, isNew, hasPos, ign, hadFirstPos;
+  float    lat, lon, firstLat, firstLon, movedM;
   uint16_t id, minutes;
   uint32_t first, last, lastEmit, lastMinute, lastFwd, count;
   char     detail[48];
@@ -91,6 +91,7 @@ static volatile bool wantList = false;
 static volatile bool wantClear = false;
 static volatile bool wantEvlog = false;
 static volatile bool wantEvclear = false;
+static volatile bool wantFakeFollow = false;
 
 // Evidence log: a compact, flash-backed ring of alerts, oldest first. It
 // survives reboots, so a sweep's findings are not lost with power.
@@ -178,6 +179,35 @@ static bool closeAlarm = false;
 
 // ------------------------------------------------------------------ helpers
 static bool isThreat(uint8_t cat) { return cat != CAT_BEACON && cat != CAT_TRACKER && cat != CAT_MESH; }
+
+// Great-circle distance in metres between two WGS84 points.
+static float distM(float la1, float lo1, float la2, float lo2) {
+  const float R = 6371000.0f, D = 0.017453293f;  // deg->rad
+  float dla = (la2 - la1) * D, dlo = (lo2 - lo1) * D;
+  float a = sinf(dla / 2) * sinf(dla / 2) +
+            cosf(la1 * D) * cosf(la2 * D) * sinf(dlo / 2) * sinf(dlo / 2);
+  return R * 2 * atan2f(sqrtf(a), sqrtf(1 - a));
+}
+
+// Categories whose continued co-presence (without GPS) suggests being followed:
+// wearable / body-worn surveillance that would normally pass by, not linger.
+static bool mobileCat(uint8_t c) { return c == CAT_TRACKER || c == CAT_AXON || c == CAT_GLASSES; }
+// Fixed infrastructure / noise that should never be called "following".
+static bool fixedCat(uint8_t c) {
+  return c == CAT_BEACON || c == CAT_MESH || c == CAT_FLOCK || c == CAT_CAMERA || c == CAT_RAVEN;
+}
+// Decide whether a device has become a "following you" case.
+static bool isFollowing(const Dev& d) {
+  // Strongest signal: the radio has GPS and this device stayed in range while
+  // you actually travelled a real distance. Works for any non-fixed category.
+  if (!fixedCat(d.cat) && d.hadFirstPos && d.movedM >= FOLLOW_MOVE_M && d.minutes >= 2)
+    return true;
+  // Trackers keep their own (longer) time-only threshold.
+  if (d.cat == CAT_TRACKER) return d.minutes >= TRACKER_PERSIST_MINUTES;
+  // Other wearable surveillance: flagged on prolonged co-presence.
+  if (mobileCat(d.cat)) return d.minutes >= FOLLOW_MINUTES;
+  return false;
+}
 
 static uint16_t catColor(uint8_t cat) {
   switch (cat) {
@@ -965,14 +995,21 @@ static void handleHit(const Hit& h) {
   d.known = baselineState == BL_ACTIVE && blKnown(mh);
   d.ign = ignored(mh);
   double gla, glo;
-  if (mesh::pos(&gla, &glo)) { d.lat = gla; d.lon = glo; d.hasPos = true; }
+  if (mesh::pos(&gla, &glo)) {
+    d.lat = gla; d.lon = glo; d.hasPos = true;
+    if (!d.hadFirstPos) { d.firstLat = gla; d.firstLon = glo; d.hadFirstPos = true; }
+    else {
+      float m = distM(d.firstLat, d.firstLon, (float)gla, (float)glo);
+      if (m > d.movedM) d.movedM = m;
+    }
+  }
 
   uint32_t minute = now / 60000;
   bool nowPersistent = false;
   if (minute != d.lastMinute) {
     d.lastMinute = minute;
     d.minutes++;
-    if (d.cat == CAT_TRACKER && !d.persist && d.minutes >= TRACKER_PERSIST_MINUTES) {
+    if (!d.persist && isFollowing(d)) {
       d.persist = true;
       nowPersistent = true;
     }
@@ -1116,16 +1153,24 @@ static void drawBanner() {
     canvas.fillScreen(catColor(d.cat));
     canvas.setTextColor(TFT_BLACK);
     canvas.setFont(&fonts::FreeSansBold12pt7b);
-    canvas.drawString(d.persist ? "TRACKER FOLLOWING?" : labelFor(d.cat, d.method), 120, 36);
-    if (d.isNew) {
-      canvas.setFont(&fonts::FreeSansBold9pt7b);
-      canvas.drawString("NEW IN AREA", 120, 58);
-    }
+    canvas.drawString(d.persist ? "FOLLOWING YOU" : labelFor(d.cat, d.method), 120, 36);
+    canvas.setFont(&fonts::FreeSansBold9pt7b);
+    if (d.persist) canvas.drawString(labelFor(d.cat, d.method), 120, 58);
+    else if (d.isNew) canvas.drawString("NEW IN AREA", 120, 58);
     canvas.setFont(&fonts::FreeSans9pt7b);
     snprintf(line, sizeof(line), "%d dBm   conf %u/4", d.rssi, d.conf);
     canvas.drawString(line, 120, 78);
     canvas.setFont(&fonts::Font0);
-    if (d.detail[0]) canvas.drawString(d.detail, 120, 104);
+    char fb[48];
+    const char* det = d.detail;
+    if (d.persist) {
+      if (d.hadFirstPos && d.movedM >= FOLLOW_MOVE_M)
+        snprintf(fb, sizeof(fb), "stayed ~%dm as you moved, %um", (int)d.movedM, d.minutes);
+      else
+        snprintf(fb, sizeof(fb), "in range %u separate minutes", d.minutes);
+      det = fb;
+    }
+    if (det[0]) canvas.drawString(det, 120, 104);
     snprintf(line, sizeof(line), "%02x:%02x:%02x:%02x:%02x:%02x  %s", d.mac[0], d.mac[1], d.mac[2],
              d.mac[3], d.mac[4], d.mac[5], METHOD_KEY[d.method]);
     canvas.drawString(line, 120, 120);
@@ -1953,6 +1998,7 @@ static void serialCommands() {
       static const uint8_t m[6] = {0x3c, 0x1a, 0x2b, 0x44, 0x55, 0x66};
       pushHit(CAT_DRONE, M_ODID_WIFI, 4, m, -60, 6, "Remote ID (beacon)");
     }
+    else if (!strcmp(cmd, "fakefollow")) wantFakeFollow = true;
     else if (!strncmp(cmd, "pin ", 4)) mesh::setPin(strtoul(cmd + 4, nullptr, 10));
     else if (!strcmp(cmd, "shot")) {
       const uint8_t* px = (const uint8_t*)canvas.getBuffer();
@@ -2354,6 +2400,29 @@ void loop() {
     emitStatus();
     for (auto& d : devs) if (d.used) emitDev(d, "list");
     sendLine("{\"t\":\"end\"}");
+  }
+  if (wantFakeFollow) {
+    wantFakeFollow = false;
+    // synthesise a body cam that has shadowed you for several minutes
+    int i = -1;
+    for (int k = 0; k < MAX_DEVS; k++) if (!devs[k].used) { i = k; break; }
+    if (i >= 0) {
+      Dev& d = devs[i];
+      memset(&d, 0, sizeof(d));
+      d.used = true; d.id = nextId++;
+      d.cat = CAT_AXON; d.method = M_BLE_OUI; d.conf = 4;
+      static const uint8_t m[6] = {0x00, 0x25, 0xdf, 0xab, 0xcd, 0xef};
+      memcpy(d.mac, m, 6);
+      d.rssi = d.peak = -58; d.ch = 0;
+      d.first = now - 300000; d.last = now;
+      d.minutes = FOLLOW_MINUTES; d.lastMinute = now / 60000;
+      d.count = 42;
+      strlcpy(d.detail, "Axon body cam", sizeof(d.detail));
+      d.persist = isFollowing(d);
+      raise(i, true);
+      d.lastEmit = now;
+      emitDev(d, "persist");
+    }
   }
   if (wantEvlog) { wantEvlog = false; emitEvlog(); }
   if (wantEvclear) {
