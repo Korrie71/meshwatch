@@ -34,7 +34,7 @@ pio run -t upload
 ### Flash the prebuilt binary manually
 
 ```sh
-esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v2.0.0-8MB.bin
+esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v2.1.0-8MB.bin
 ```
 
 
@@ -183,6 +183,10 @@ Other features:
   clear the list from Settings.
 - **Close-range alarm** (SETTINGS): when a threat comes within about -52 dBm,
   the alert switches to an urgent repeating tone.
+- **Boot splash**: a branded animated start-up screen (logo, wordmark, version);
+  tap a button to skip it.
+- **Battery icon**: the header shows a colour-coded battery (green / amber / red,
+  with a charge tick on USB power) instead of a bare percentage.
 
 Debugging over USB serial: `firmware/shot.py` presses buttons and saves
 screenshots; the firmware also prints pairing diagnostics as JSON lines.

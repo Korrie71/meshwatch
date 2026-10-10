@@ -21,7 +21,7 @@
 #include "signatures.h"
 #include "mesh.h"
 
-#define FW_VERSION "2.0.0"
+#define FW_VERSION "2.1.0"
 
 // ------------------------------------------------------------------- config
 #define CHANNEL_DWELL_MS   250
@@ -1210,6 +1210,8 @@ static bool locked = false;
 #define COL_OK    0x07E0
 #define COL_MINE  0x9FF3
 #define COL_BAD   0xF9A6
+#define COL_BRAND 0x3EF2   // MeshWatch green (#3ddc97)
+#define COL_AMBER 0xFE60
 
 static const char* meshStateText() {
   switch (mesh::state()) {
@@ -1254,9 +1256,19 @@ static void drawHeader(const char* title) {
     canvas.setTextColor(COL_DIM);
     canvas.drawString(buf, 177, 3);
   }
-  canvas.setTextColor(COL_DIM);
-  snprintf(buf, sizeof(buf), "%3d%%", (int)M5.Power.getBatteryLevel());
-  canvas.drawRightString(buf, 238, 3);
+  // battery icon, coloured by level (green / amber / red), filled proportionally
+  int bl = constrain((int)M5.Power.getBatteryLevel(), 0, 100);
+  bool charging = M5.Power.isCharging();
+  uint16_t bc = charging ? COL_OK : bl > 50 ? COL_OK : bl > 20 ? COL_AMBER : COL_BAD;
+  const int bx = 219, by = 3, bw = 17, bh = 9;
+  canvas.drawRect(bx, by, bw, bh, COL_DIM);
+  canvas.fillRect(bx + bw, by + 2, 2, bh - 4, COL_DIM);       // positive nub
+  int fw = (bw - 2) * bl / 100;
+  if (fw > 0) canvas.fillRect(bx + 1, by + 1, fw, bh - 2, bc);
+  if (charging) {                                             // small charge tick
+    canvas.setTextColor(TFT_BLACK);
+    canvas.drawString("+", bx + 6, by + 1);
+  }
 }
 
 static void drawHint(const char* hint) {
@@ -2536,6 +2548,52 @@ static void convoyCheck() {
   raiseConvoy(n);
 }
 
+// Animated boot splash: brand mark, wordmark, and a radar sweep with a filling
+// progress bar. p runs 0..1 over the animation.
+static void drawSplash(float p) {
+  canvas.fillSprite(0x0841);                               // near-black ground
+  // decorative radar arcs + sweep, tucked into the bottom-right so they stay
+  // clear of the wordmark
+  const int cx = 232, cy = 150;
+  for (int r = 40; r <= 150; r += 28) canvas.drawCircle(cx, cy, r, 0x1084);
+  float a = 3.1416f + p * 6.2832f;
+  canvas.drawLine(cx, cy, cx + cosf(a) * 150, cy + sinf(a) * 150, 0x236B);
+
+  // logo tile with "M"
+  const int lx = 6, ly = 33, ls = 28;
+  canvas.fillRoundRect(lx, ly, ls, ls, 7, COL_BRAND);
+  canvas.setTextDatum(middle_center);
+  canvas.setFont(&fonts::FreeSansBold18pt7b);
+  canvas.setTextColor(TFT_BLACK);
+  canvas.drawString("M", lx + ls / 2, ly + ls / 2 - 1);
+
+  // wordmark: Mesh (white) + Watch (brand)
+  canvas.setTextDatum(middle_left);
+  const int tx = lx + ls + 6;
+  canvas.setTextColor(TFT_WHITE);
+  canvas.drawString("Mesh", tx, ly + ls / 2 - 1);
+  int w = canvas.textWidth("Mesh");
+  canvas.setTextColor(COL_BRAND);
+  canvas.drawString("Watch", tx + w, ly + ls / 2 - 1);
+
+  // tagline + version
+  canvas.setTextDatum(top_left);
+  canvas.setFont(&fonts::Font0);
+  canvas.setTextColor(COL_DIM);
+  canvas.drawString("passive counter-surveillance detector", 20, 84);
+  char v[40];
+  snprintf(v, sizeof(v), "v%s   M5Stack StickS3", FW_VERSION);
+  canvas.setTextColor(COL_FAINT);
+  canvas.drawString(v, 20, 98);
+
+  // progress bar
+  const int px = 20, pw = 200, py = 118;
+  canvas.drawRoundRect(px, py, pw, 6, 2, 0x2965);
+  int fill = (int)(pw * constrain(p, 0.0f, 1.0f));
+  if (fill > 2) canvas.fillRoundRect(px, py, fill, 6, 2, COL_BRAND);
+  canvas.pushSprite(0, 0);
+}
+
 // --------------------------------------------------------------------- main
 void setup() {
   auto cfg = M5.config();
@@ -2575,14 +2633,23 @@ void setup() {
   canvas.createSprite(240, 135);
   M5.Speaker.setVolume(160);
 
+  // boot splash (plays over the radio/scanner init that follows)
+  M5.Speaker.tone(1500, 70);
+  M5.Speaker.tone(2200, 90, -1, false);
+  uint32_t t0 = millis();
+  while (millis() - t0 < 1500) {
+    M5.update();
+    if (M5.BtnA.wasClicked() || M5.BtnB.wasClicked()) break;   // tap to skip
+    drawSplash((millis() - t0) / 1500.0f);
+    delay(20);
+  }
+  drawSplash(1.0f);
+
   hitQ = xQueueCreate(48, sizeof(Hit));
   wifiStart();
   bleStart();
   mesh::begin();
   if (stealthOn) applyStealth();
-
-  M5.Speaker.tone(1200, 60);
-  M5.Speaker.tone(1800, 80, -1, false);
   emitStatus();
 
   if (lockOn && lockPin) {
