@@ -418,9 +418,15 @@ function meters(a, b) {
 
 function onDetEvent(ev) {
   if (ev.t === "st") {
+    const wasDemo = det.status?.demo;
     det.status = ev;
     $("muteOn").checked = !!ev.mute;
+    if (ev.demo && !wasDemo) toast("Emulator ON — these detections are simulated", true);
     return renderDetections();
+  }
+  if (ev.t === "demo") {
+    if (ev.on) toast("Emulator ON — these detections are simulated", true);
+    return;
   }
   if (ev.t === "convoy") {
     toast(`CONVOY — ${ev.n} units may be tailing you`, true);

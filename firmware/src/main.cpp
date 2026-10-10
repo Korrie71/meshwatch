@@ -21,7 +21,7 @@
 #include "signatures.h"
 #include "mesh.h"
 
-#define FW_VERSION "2.1.2"
+#define FW_VERSION "2.2.0"
 
 // ------------------------------------------------------------------- config
 #define CHANNEL_DWELL_MS   250
@@ -122,6 +122,12 @@ static uint16_t screenOffSecs = 0;   // 0 = never
 static bool asleep = false;
 static uint32_t lastInput = 0;
 static uint32_t sessionStart = 0;   // sweep window start: boot, or last clear
+// Emulator / demo mode: injects synthetic detections for every category through
+// the real pipeline, so the whole detector and UI can be exercised with no RF.
+// Never transmits; never persisted; mesh forwarding is suppressed while on.
+static bool demoMode = false;
+static uint32_t demoStart = 0;
+static void setDemo(bool on);       // defined later, with the emulator engine
 
 static Preferences uiPrefs;
 static bool fwdOn = false;
@@ -946,10 +952,10 @@ static int activeCount(uint8_t cat) {
 static void emitStatus() {
   char line[200];
   snprintf(line, sizeof(line),
-    "{\"t\":\"st\",\"fw\":\"%s\",\"up\":%lu,\"bat\":%d,\"mute\":%d,\"ch\":%u,"
+    "{\"t\":\"st\",\"fw\":\"%s\",\"up\":%lu,\"bat\":%d,\"mute\":%d,\"demo\":%d,\"ch\":%u,"
     "\"flock\":%d,\"raven\":%d,\"axon\":%d,\"tracker\":%d,\"glasses\":%d,\"beacon\":%d}",
     FW_VERSION, (unsigned long)(millis() / 1000), (int)M5.Power.getBatteryLevel(), muted ? 1 : 0,
-    curChannel, activeCount(CAT_FLOCK), activeCount(CAT_RAVEN), activeCount(CAT_AXON),
+    demoMode ? 1 : 0, curChannel, activeCount(CAT_FLOCK), activeCount(CAT_RAVEN), activeCount(CAT_AXON),
     activeCount(CAT_TRACKER), activeCount(CAT_GLASSES), activeCount(CAT_BEACON));
   sendLine(line);
 }
@@ -1261,7 +1267,10 @@ static void drawHeader(const char* title) {
     canvas.drawString(buf, 166, 3);
   }
   uint32_t e = mesh::epoch();
-  if (muted) {
+  if (demoMode) {                        // unmistakable: these detections are fake
+    canvas.setTextColor(COL_AMBER);
+    canvas.drawString("DEMO", 184, 3);
+  } else if (muted) {
     canvas.setTextColor(COL_BAD);
     canvas.drawString("MUTE", 186, 3);
   } else if (e) {
@@ -1576,7 +1585,7 @@ static void drawType() {
   drawHint("A pick, hold: del   B next, hold: fast");
 }
 
-#define SETTING_COUNT 15
+#define SETTING_COUNT 16
 static void drawSettings() {
   drawHeader("SETTINGS");
   drawRows(SETTING_COUNT, 19, 8, [&](int i, char* left, char* right, uint16_t* col) {
@@ -1663,6 +1672,11 @@ static void drawSettings() {
         if (!canarySsid[0]) strlcpy(right, "set in app", 16);
         else { strlcpy(right, canaryOn ? canarySsid : "off", 16); }
         if (canaryOn && canarySsid[0]) *col = COL_MINE;
+        break;
+      case 15:
+        strlcpy(left, "Emulator (demo, no RF)", 40);
+        strlcpy(right, demoMode ? "running" : "off", 16);
+        if (demoMode) *col = COL_AMBER;
         break;
     }
   });
@@ -2214,6 +2228,9 @@ static void changeSetting(int i) {
         uiPrefs.putBool("canon", canaryOn);
       }
       break;
+    case 15:
+      setDemo(!demoMode);                  // emulator / demo mode (not persisted)
+      break;
     case 6:
       brightness = brightness >= 250 ? 30 : brightness >= 160 ? 255 : brightness >= 90 ? 160 : 90;
       M5.Display.setBrightness(brightness);
@@ -2289,6 +2306,8 @@ static void serialCommands() {
       static const uint8_t m[6] = {0x02, 0x7b, 0xee, 0x44, 0x55, 0x66};
       pushHit(CAT_TRACKER, M_TRACKER_NAME, 3, m, -62, 0, "PebbleBee Clip");
     }
+    else if (!strcmp(cmd, "emulate on") || !strcmp(cmd, "demo on")) setDemo(true);
+    else if (!strcmp(cmd, "emulate off") || !strcmp(cmd, "demo off")) setDemo(false);
     else if (!strcmp(cmd, "fakeconvoy")) wantFakeConvoy = true;
     else if (!strcmp(cmd, "fakerot")) {
       // same named unit, a new MAC each call: tests MAC-rotation grouping
@@ -2465,6 +2484,7 @@ static void handleButtons() {
 
 // Sends pending alerts to the mesh, spaced out to respect LoRa airtime.
 static void forwardAlerts() {
+  if (demoMode) return;                 // never forward emulated detections
   static uint32_t lastSent = 0;
   uint32_t now = millis();
   if (lastSent && now - lastSent < FWD_GAP_MS) return;
@@ -2505,7 +2525,7 @@ static int fwdConvIndex() {
 static void autoReport() {
   static uint32_t lastReport = 0;
   uint32_t now = millis();
-  if (!reportOn || mesh::state() != mesh::READY) return;
+  if (demoMode || !reportOn || mesh::state() != mesh::READY) return;
   if (lastReport && now - lastReport < REPORT_INTERVAL_MS) return;
   int target = fwdConvIndex();
   if (target < 0) return;
@@ -2560,7 +2580,7 @@ static void raiseConvoy(int n) {
   snprintf(line, sizeof(line), "{\"t\":\"convoy\",\"n\":%d}", n);
   sendLine(line);
 
-  if (fwdOn && mesh::state() == mesh::READY) {        // tell the team
+  if (fwdOn && !demoMode && mesh::state() == mesh::READY) {   // tell the team
     int target = fwdConvIndex();
     if (target >= 0) {
       char text[MESH_TEXT_MAX + 1];
@@ -2584,6 +2604,70 @@ static void convoyCheck() {
   if (n < CONVOY_MIN || now < armAt) return;
   armAt = now + CONVOY_COOLDOWN_MS;
   raiseConvoy(n);
+}
+
+// ------------------------------------------------------------- emulator / demo
+// A believable ambient environment: one representative device per category,
+// re-announced so they stay "in range". Behavioural alerts (following, convoy,
+// canary, handshake) fire on a timed loop. All synthetic; nothing is transmitted.
+struct SimDev { uint8_t cat, method, conf; int8_t rssi; uint8_t ch; uint8_t tail; const char* name; };
+static const SimDev SIM_DEVS[] = {
+  {CAT_FLOCK,   M_WIFI_SSID, 4, -62, 6, 0x01, "Flock-7Q2A"},
+  {CAT_RAVEN,   M_BLE_SVC,   3, -70, 0, 0x02, "svc 0x3200"},
+  {CAT_AXON,    M_BLE_OUI,   4, -58, 0, 0x03, "Axon-X9"},
+  {CAT_TRACKER, M_FINDMY,    2, -67, 0, 0x0c, "Find My (separated)"},
+  {CAT_GLASSES, M_BLE_SVC,   2, -66, 0, 0x04, "Meta wearable"},
+  {CAT_BEACON,  M_IBEACON,   1, -74, 0, 0x05, "iBeacon"},
+  {CAT_MESH,    M_BLE_NAME,  2, -68, 0, 0x06, "MeshCore-4b"},
+  {CAT_ROGUE,   M_KARMA,     3, -60, 6, 0x07, "8 SSIDs in 12s"},
+  {CAT_ATTACK,  M_FLIPPER,   4, -55, 0, 0x08, "Flipper Zero white"},
+  {CAT_SKIMMER, M_SKIMMER,   3, -64, 0, 0x09, "HC-05"},
+  {CAT_CAMERA,  M_CAM_SSID,  3, -59, 6, 0x0a, "Reolink-Cam"},
+  {CAT_DRONE,   M_ODID_WIFI, 4, -61, 6, 0x0b, "Remote ID (beacon)"},
+};
+static const size_t SIM_DEV_COUNT = sizeof(SIM_DEVS) / sizeof(SIM_DEVS[0]);
+
+static void demoTick() {
+  if (!demoMode) return;
+  uint32_t now = millis();
+
+  // keep the ambient devices present (re-announce every ~2 s with RSSI jitter)
+  static uint32_t lastInject = 0;
+  if (now - lastInject > 2000) {
+    lastInject = now;
+    for (size_t i = 0; i < SIM_DEV_COUNT; i++) {
+      const SimDev& s = SIM_DEVS[i];
+      uint8_t mac[6] = {0x02, 0xde, 0x11, 0x00, 0x00, s.tail};
+      int8_t jitter = (int8_t)((now / 2000 + i) % 7) - 3;
+      pushHit(s.cat, s.method, s.conf, mac, s.rssi + jitter, s.ch, s.name);
+    }
+  }
+
+  // behavioural alerts on a 40 s loop
+  uint32_t t = (now - demoStart) % 40000;
+  static int lastPhase = -1;
+  int phase = t / 8000;              // 0..4
+  if (phase != lastPhase) {
+    lastPhase = phase;
+    if (phase == 1) wantFakeFollow = true;                 // a tracker follows you
+    else if (phase == 2) wantFakeConvoy = true;            // a convoy forms
+    else if (phase == 3) {                                 // canary evil twin
+      uint8_t m[6] = {0x02, 0xca, 0x11, 0x00, 0x00, 0xf0};
+      pushHit(CAT_CANARY, M_CANARY_AP, 4, m, -56, 6, canarySsid[0] ? canarySsid : "HomeNet-5G");
+    } else if (phase == 4) {                               // WPA handshake capture
+      uint8_t m[6] = {0x02, 0xa0, 0x63, 0x00, 0x00, 0x91};
+      pushHit(CAT_ATTACK, M_HANDSHAKE, 4, m, -53, 6, "deauth + EAPOL capture");
+    }
+  }
+}
+
+static void setDemo(bool on) {
+  demoMode = on;
+  demoStart = millis();
+  if (on) { memset(devs, 0, sizeof(devs)); sessionStart = millis(); }
+  char line[48];
+  snprintf(line, sizeof(line), "{\"t\":\"demo\",\"on\":%d}", on ? 1 : 0);
+  sendLine(line);
 }
 
 // Animated boot splash: brand mark, wordmark, and a radar sweep with a filling
@@ -2825,6 +2909,7 @@ void loop() {
     autoReport();
   }
   convoyCheck();
+  demoTick();
 
   if (wantClear) {
     wantClear = false;
