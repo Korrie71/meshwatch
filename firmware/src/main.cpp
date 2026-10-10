@@ -21,7 +21,7 @@
 #include "signatures.h"
 #include "mesh.h"
 
-#define FW_VERSION "2.3.0"
+#define FW_VERSION "2.4.0"
 
 // ------------------------------------------------------------------- config
 #define CHANNEL_DWELL_MS   250
@@ -122,14 +122,6 @@ static uint16_t screenOffSecs = 0;   // 0 = never
 static bool asleep = false;
 static uint32_t lastInput = 0;
 static uint32_t sessionStart = 0;   // sweep window start: boot, or last clear
-// Emulator / demo mode: injects synthetic detections for every category through
-// the real pipeline, so the whole detector and UI can be exercised with no RF.
-// Never transmits; never persisted; mesh forwarding is suppressed while on.
-static bool demoMode = false;
-static uint32_t demoStart = 0;
-static uint16_t emuMask = SCAN_ALL;   // which categories the emulator simulates (per CAT bit)
-static bool emuFollow = true, emuConvoy = true, emuCanary = true, emuHandshake = true;
-static void setDemo(bool on);       // defined later, with the emulator engine
 
 static Preferences uiPrefs;
 static bool fwdOn = false;
@@ -954,10 +946,10 @@ static int activeCount(uint8_t cat) {
 static void emitStatus() {
   char line[200];
   snprintf(line, sizeof(line),
-    "{\"t\":\"st\",\"fw\":\"%s\",\"up\":%lu,\"bat\":%d,\"mute\":%d,\"demo\":%d,\"ch\":%u,"
+    "{\"t\":\"st\",\"fw\":\"%s\",\"up\":%lu,\"bat\":%d,\"mute\":%d,\"ch\":%u,"
     "\"flock\":%d,\"raven\":%d,\"axon\":%d,\"tracker\":%d,\"glasses\":%d,\"beacon\":%d}",
     FW_VERSION, (unsigned long)(millis() / 1000), (int)M5.Power.getBatteryLevel(), muted ? 1 : 0,
-    demoMode ? 1 : 0, curChannel, activeCount(CAT_FLOCK), activeCount(CAT_RAVEN), activeCount(CAT_AXON),
+    curChannel, activeCount(CAT_FLOCK), activeCount(CAT_RAVEN), activeCount(CAT_AXON),
     activeCount(CAT_TRACKER), activeCount(CAT_GLASSES), activeCount(CAT_BEACON));
   sendLine(line);
 }
@@ -1185,7 +1177,7 @@ static void handleHit(const Hit& h) {
 }
 
 // ----------------------------------------------------------------------- UI
-enum Screen : uint8_t { SCR_DETECT, SCR_MESH, SCR_THREAD, SCR_COMPOSE, SCR_TYPE, SCR_SETTINGS, SCR_PICK, SCR_SCAN, SCR_FIND, SCR_TRACK, SCR_BASELINE, SCR_RADAR, SCR_SUMMARY, SCR_EMULATOR };
+enum Screen : uint8_t { SCR_DETECT, SCR_MESH, SCR_THREAD, SCR_COMPOSE, SCR_TYPE, SCR_SETTINGS, SCR_PICK, SCR_SCAN, SCR_FIND, SCR_TRACK, SCR_BASELINE, SCR_RADAR, SCR_SUMMARY };
 static Screen screen = SCR_DETECT;
 static int sel = 0;                 // cursor in the current list
 static float hlY = -1;             // animated list-highlight Y (eased toward sel)
@@ -1269,10 +1261,7 @@ static void drawHeader(const char* title) {
     canvas.drawString(buf, 166, 3);
   }
   uint32_t e = mesh::epoch();
-  if (demoMode) {                        // unmistakable: these detections are fake
-    canvas.setTextColor(COL_AMBER);
-    canvas.drawString("DEMO", 184, 3);
-  } else if (muted) {
+  if (muted) {
     canvas.setTextColor(COL_BAD);
     canvas.drawString("MUTE", 186, 3);
   } else if (e) {
@@ -1587,7 +1576,7 @@ static void drawType() {
   drawHint("A pick, hold: del   B next, hold: fast");
 }
 
-#define SETTING_COUNT 16
+#define SETTING_COUNT 15
 static void drawSettings() {
   drawHeader("SETTINGS");
   drawRows(SETTING_COUNT, 19, 8, [&](int i, char* left, char* right, uint16_t* col) {
@@ -1675,11 +1664,6 @@ static void drawSettings() {
         else { strlcpy(right, canaryOn ? canarySsid : "off", 16); }
         if (canaryOn && canarySsid[0]) *col = COL_MINE;
         break;
-      case 15:
-        strlcpy(left, "Emulator (demo, no RF)", 40);
-        strlcpy(right, demoMode ? "running" : "off", 16);
-        if (demoMode) *col = COL_AMBER;
-        break;
     }
   });
   drawHint(sel == 0 ? "A choose radio   hold A: forget" : "A change   B next   hold B: detect");
@@ -1693,7 +1677,7 @@ static const char* const SCAN_NAME[CAT_COUNT] = {
 };
 
 // The apps come first, then "Scan all", then the categories.
-#define MENU_APPS 6
+#define MENU_APPS 5
 #define MENU_ROWS (CAT_COUNT + 1 + MENU_APPS)
 static void drawScan() {
   drawHeader("MENU");
@@ -1734,12 +1718,6 @@ static void drawScan() {
       for (auto& d : devs) if (d.used && isThreat(d.cat) && d.conf >= CONF_ALERT) t++;
       if (t) { snprintf(right, 16, "%d threats", t); *col = COL_BAD; }
       else   { strlcpy(right, "clean", 16); *col = COL_OK; }
-      return;
-    }
-    if (i == 5) {
-      strlcpy(left, " >  Emulator (demo)", 40);
-      strlcpy(right, demoMode ? "running" : "off", 16);
-      *col = demoMode ? COL_AMBER : COL_OK;
       return;
     }
     int cat = i - MENU_APPS - 1;
@@ -2067,43 +2045,6 @@ static void drawSummary() {
   drawHint("B refresh   hold A: new sweep   hold B: back");
 }
 
-// Emulator picker: choose which categories and behavioural scenarios the no-RF
-// emulator simulates, and start/stop it. Rows: Start/Stop, four scenario
-// toggles, "all categories", then one checkbox per category.
-#define EMU_ROWS (6 + CAT_COUNT)
-static void drawEmulator() {
-  drawHeader("EMULATOR (no RF)");
-  drawRows(EMU_ROWS, 19, 8, [&](int i, char* left, char* right, uint16_t* col) {
-    if (i == 0) {
-      strlcpy(left, " >  Start / Stop", 40);
-      strlcpy(right, demoMode ? "RUNNING" : "off", 16);
-      *col = demoMode ? COL_AMBER : COL_OK;
-      return;
-    }
-    if (i >= 1 && i <= 4) {
-      static const char* const sc[4] = {"Following you", "Convoy", "Canary evil-twin",
-                                        "Handshake capture"};
-      const bool on[4] = {emuFollow, emuConvoy, emuCanary, emuHandshake};
-      snprintf(left, 40, "[%c] %s", on[i - 1] ? 'x' : ' ', sc[i - 1]);
-      if (!on[i - 1]) *col = COL_DIM;
-      return;
-    }
-    if (i == 5) {
-      bool all = (emuMask & SCAN_ALL) == SCAN_ALL;
-      snprintf(left, 40, "[%c] All categories", all ? 'x' : ' ');
-      if (!all) *col = COL_DIM;
-      return;
-    }
-    int c = i - 6;
-    bool on = emuMask & (1 << c);
-    snprintf(left, 40, "[%c] %s", on ? 'x' : ' ', SCAN_NAME[c]);
-    if (!on) *col = COL_DIM;
-    else *col = catColor(c);
-  });
-  drawHint(sel == 0 ? "A start/stop   B next   hold B: back"
-                    : "A toggle   B next   hold B: back");
-}
-
 static void drawPick() {
   drawHeader("CHOOSE RADIO");
   mesh::Radio list[6];
@@ -2144,7 +2085,6 @@ static void draw() {
     case SCR_BASELINE: drawBaseline(); break;
     case SCR_RADAR:    drawRadar(); break;
     case SCR_SUMMARY:  drawSummary(); break;
-    case SCR_EMULATOR: drawEmulator(); break;
   }
   canvas.pushSprite(0, 0);
 }
@@ -2275,9 +2215,6 @@ static void changeSetting(int i) {
         uiPrefs.putBool("canon", canaryOn);
       }
       break;
-    case 15:
-      setDemo(!demoMode);                  // emulator / demo mode (not persisted)
-      break;
     case 6:
       brightness = brightness >= 250 ? 30 : brightness >= 160 ? 255 : brightness >= 90 ? 160 : 90;
       M5.Display.setBrightness(brightness);
@@ -2353,8 +2290,6 @@ static void serialCommands() {
       static const uint8_t m[6] = {0x02, 0x7b, 0xee, 0x44, 0x55, 0x66};
       pushHit(CAT_TRACKER, M_TRACKER_NAME, 3, m, -62, 0, "PebbleBee Clip");
     }
-    else if (!strcmp(cmd, "emulate on") || !strcmp(cmd, "demo on")) setDemo(true);
-    else if (!strcmp(cmd, "emulate off") || !strcmp(cmd, "demo off")) setDemo(false);
     else if (!strcmp(cmd, "fakeconvoy")) wantFakeConvoy = true;
     else if (!strcmp(cmd, "fakerot")) {
       // same named unit, a new MAC each call: tests MAC-rotation grouping
@@ -2465,7 +2400,6 @@ static void handleButtons() {
         else if (sel == 2) go(SCR_BASELINE);
         else if (sel == 3) go(SCR_RADAR);
         else if (sel == 4) go(SCR_SUMMARY);
-        else if (sel == 5) go(SCR_EMULATOR);
         else toggleScan(sel - MENU_APPS);
       }
       if (bHold) go(SCR_DETECT);
@@ -2496,20 +2430,6 @@ static void handleButtons() {
     case SCR_SUMMARY:
       if (aHold) { memset(devs, 0, sizeof(devs)); bannerDev = -1; sessionStart = millis(); }
       if (bHold) { go(SCR_SCAN); sel = 4; }
-      break;
-
-    case SCR_EMULATOR:
-      if (b) sel = (sel + 1) % EMU_ROWS;
-      if (a) {
-        if (sel == 0) setDemo(!demoMode);
-        else if (sel == 1) emuFollow = !emuFollow;
-        else if (sel == 2) emuConvoy = !emuConvoy;
-        else if (sel == 3) emuCanary = !emuCanary;
-        else if (sel == 4) emuHandshake = !emuHandshake;
-        else if (sel == 5) emuMask = (emuMask & SCAN_ALL) == SCAN_ALL ? 0 : SCAN_ALL;
-        else emuMask ^= (1 << (sel - 6));
-      }
-      if (bHold) { go(SCR_SCAN); sel = 5; }
       break;
 
     case SCR_TRACK:
@@ -2546,7 +2466,6 @@ static void handleButtons() {
 
 // Sends pending alerts to the mesh, spaced out to respect LoRa airtime.
 static void forwardAlerts() {
-  if (demoMode) return;                 // never forward emulated detections
   static uint32_t lastSent = 0;
   uint32_t now = millis();
   if (lastSent && now - lastSent < FWD_GAP_MS) return;
@@ -2587,7 +2506,7 @@ static int fwdConvIndex() {
 static void autoReport() {
   static uint32_t lastReport = 0;
   uint32_t now = millis();
-  if (demoMode || !reportOn || mesh::state() != mesh::READY) return;
+  if (!reportOn || mesh::state() != mesh::READY) return;
   if (lastReport && now - lastReport < REPORT_INTERVAL_MS) return;
   int target = fwdConvIndex();
   if (target < 0) return;
@@ -2642,7 +2561,7 @@ static void raiseConvoy(int n) {
   snprintf(line, sizeof(line), "{\"t\":\"convoy\",\"n\":%d}", n);
   sendLine(line);
 
-  if (fwdOn && !demoMode && mesh::state() == mesh::READY) {   // tell the team
+  if (fwdOn && mesh::state() == mesh::READY) {        // tell the team
     int target = fwdConvIndex();
     if (target >= 0) {
       char text[MESH_TEXT_MAX + 1];
@@ -2666,71 +2585,6 @@ static void convoyCheck() {
   if (n < CONVOY_MIN || now < armAt) return;
   armAt = now + CONVOY_COOLDOWN_MS;
   raiseConvoy(n);
-}
-
-// ------------------------------------------------------------- emulator / demo
-// A believable ambient environment: one representative device per category,
-// re-announced so they stay "in range". Behavioural alerts (following, convoy,
-// canary, handshake) fire on a timed loop. All synthetic; nothing is transmitted.
-struct SimDev { uint8_t cat, method, conf; int8_t rssi; uint8_t ch; uint8_t tail; const char* name; };
-static const SimDev SIM_DEVS[] = {
-  {CAT_FLOCK,   M_WIFI_SSID, 4, -62, 6, 0x01, "Flock-7Q2A"},
-  {CAT_RAVEN,   M_BLE_SVC,   3, -70, 0, 0x02, "svc 0x3200"},
-  {CAT_AXON,    M_BLE_OUI,   4, -58, 0, 0x03, "Axon-X9"},
-  {CAT_TRACKER, M_FINDMY,    2, -67, 0, 0x0c, "Find My (separated)"},
-  {CAT_GLASSES, M_BLE_SVC,   2, -66, 0, 0x04, "Meta wearable"},
-  {CAT_BEACON,  M_IBEACON,   1, -74, 0, 0x05, "iBeacon"},
-  {CAT_MESH,    M_BLE_NAME,  2, -68, 0, 0x06, "MeshCore-4b"},
-  {CAT_ROGUE,   M_KARMA,     3, -60, 6, 0x07, "8 SSIDs in 12s"},
-  {CAT_ATTACK,  M_FLIPPER,   4, -55, 0, 0x08, "Flipper Zero white"},
-  {CAT_SKIMMER, M_SKIMMER,   3, -64, 0, 0x09, "HC-05"},
-  {CAT_CAMERA,  M_CAM_SSID,  3, -59, 6, 0x0a, "Reolink-Cam"},
-  {CAT_DRONE,   M_ODID_WIFI, 4, -61, 6, 0x0b, "Remote ID (beacon)"},
-};
-static const size_t SIM_DEV_COUNT = sizeof(SIM_DEVS) / sizeof(SIM_DEVS[0]);
-
-static void demoTick() {
-  if (!demoMode) return;
-  uint32_t now = millis();
-
-  // keep the ambient devices present (re-announce every ~2 s with RSSI jitter)
-  static uint32_t lastInject = 0;
-  if (now - lastInject > 2000) {
-    lastInject = now;
-    for (size_t i = 0; i < SIM_DEV_COUNT; i++) {
-      const SimDev& s = SIM_DEVS[i];
-      if (!(emuMask & (1 << s.cat))) continue;             // only the chosen categories
-      uint8_t mac[6] = {0x02, 0xde, 0x11, 0x00, 0x00, s.tail};
-      int8_t jitter = (int8_t)((now / 2000 + i) % 7) - 3;
-      pushHit(s.cat, s.method, s.conf, mac, s.rssi + jitter, s.ch, s.name);
-    }
-  }
-
-  // behavioural alerts on a 40 s loop, each only if its scenario is enabled
-  uint32_t t = (now - demoStart) % 40000;
-  static int lastPhase = -1;
-  int phase = t / 8000;              // 0..4
-  if (phase != lastPhase) {
-    lastPhase = phase;
-    if (phase == 1 && emuFollow) wantFakeFollow = true;        // a tracker follows you
-    else if (phase == 2 && emuConvoy) wantFakeConvoy = true;   // a convoy forms
-    else if (phase == 3 && emuCanary) {                        // canary evil twin
-      uint8_t m[6] = {0x02, 0xca, 0x11, 0x00, 0x00, 0xf0};
-      pushHit(CAT_CANARY, M_CANARY_AP, 4, m, -56, 6, canarySsid[0] ? canarySsid : "HomeNet-5G");
-    } else if (phase == 4 && emuHandshake) {                   // WPA handshake capture
-      uint8_t m[6] = {0x02, 0xa0, 0x63, 0x00, 0x00, 0x91};
-      pushHit(CAT_ATTACK, M_HANDSHAKE, 4, m, -53, 6, "deauth + EAPOL capture");
-    }
-  }
-}
-
-static void setDemo(bool on) {
-  demoMode = on;
-  demoStart = millis();
-  if (on) { memset(devs, 0, sizeof(devs)); sessionStart = millis(); }
-  char line[48];
-  snprintf(line, sizeof(line), "{\"t\":\"demo\",\"on\":%d}", on ? 1 : 0);
-  sendLine(line);
 }
 
 // Animated boot splash: brand mark, wordmark, and a radar sweep with a filling
@@ -2972,7 +2826,6 @@ void loop() {
     autoReport();
   }
   convoyCheck();
-  demoTick();
 
   if (wantClear) {
     wantClear = false;
