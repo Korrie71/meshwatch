@@ -34,7 +34,7 @@ pio run -t upload
 ### Flash the prebuilt binary manually
 
 ```sh
-esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v2.2.0-8MB.bin
+esptool.py --chip esp32s3 write_flash 0x0 dist/meshwatch-m5sticks3-v2.2.1-8MB.bin
 ```
 
 
@@ -191,8 +191,9 @@ Other features:
   sweep has a fading trail and its blips glide to new distances, a small green
   "scanning" dot breathes in the header, and the screen fades in on wake. The UI
   runs at ~30 fps while animating and idles slowly to save power.
-- **Emulator / demo mode** (SETTINGS → "Emulator (demo, no RF)", or USB `emulate
-  on`/`off`): injects synthetic detections for every category through the real
+- **Emulator / demo mode** (MENU → "Emulator (demo)", or SETTINGS → "Emulator
+  (demo, no RF)", or USB `emulate on`/`off`): injects synthetic detections for
+  every category through the real
   detection pipeline — one device per category, plus a timed loop of behavioural
   alerts (a tracker following you, a convoy forming, a canary evil-twin, a
   deauth→handshake capture). It lets you exercise and demo the whole detector and

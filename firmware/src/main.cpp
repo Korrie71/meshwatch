@@ -21,7 +21,7 @@
 #include "signatures.h"
 #include "mesh.h"
 
-#define FW_VERSION "2.2.0"
+#define FW_VERSION "2.2.1"
 
 // ------------------------------------------------------------------- config
 #define CHANNEL_DWELL_MS   250
@@ -1690,8 +1690,8 @@ static const char* const SCAN_NAME[CAT_COUNT] = {
   "WiFi cameras (Ring/Wyze...)", "Drones (Remote ID)", "Canary SSID (your bait name)",
 };
 
-// Rows 0-1 are apps, row 2 is "Scan all", rows 3.. are the categories.
-#define MENU_APPS 5
+// The apps come first, then "Scan all", then the categories.
+#define MENU_APPS 6
 #define MENU_ROWS (CAT_COUNT + 1 + MENU_APPS)
 static void drawScan() {
   drawHeader("MENU");
@@ -1734,13 +1734,21 @@ static void drawScan() {
       else   { strlcpy(right, "clean", 16); *col = COL_OK; }
       return;
     }
+    if (i == 5) {
+      strlcpy(left, " >  Emulator (demo)", 40);
+      strlcpy(right, demoMode ? "running" : "off", 16);
+      *col = demoMode ? COL_AMBER : COL_OK;
+      return;
+    }
     int cat = i - MENU_APPS - 1;
     bool on = cat < 0 ? scanMask == SCAN_ALL : scanMask & (1 << cat);
     snprintf(left, 40, "[%c] %s", on ? 'x' : ' ', cat < 0 ? "Scan all" : SCAN_NAME[cat]);
     if (!on) *col = COL_DIM;
     else if (cat >= 0) *col = catColor(cat);
   });
-  drawHint(sel < MENU_APPS ? "A open   B next   hold B: back" : "A on/off   B next   hold B: back");
+  drawHint(sel == 5 ? "A start/stop   B next   hold B: back"
+         : sel < MENU_APPS ? "A open   B next   hold B: back"
+         : "A on/off   B next   hold B: back");
 }
 
 // Signal finder: pick a detected device, then walk around watching its signal.
@@ -2418,6 +2426,7 @@ static void handleButtons() {
         else if (sel == 2) go(SCR_BASELINE);
         else if (sel == 3) go(SCR_RADAR);
         else if (sel == 4) go(SCR_SUMMARY);
+        else if (sel == 5) setDemo(!demoMode);
         else toggleScan(sel - MENU_APPS);
       }
       if (bHold) go(SCR_DETECT);
