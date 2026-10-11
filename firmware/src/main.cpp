@@ -21,7 +21,7 @@
 #include "signatures.h"
 #include "mesh.h"
 
-#define FW_VERSION "2.4.0"
+#define FW_VERSION "2.4.1"
 
 // ------------------------------------------------------------------- config
 #define CHANNEL_DWELL_MS   250
@@ -2639,6 +2639,10 @@ void setup() {
   M5.begin(cfg);
   Serial.begin(115200);
   sessionStart = millis();
+  { const char* rr[] = {"unknown","poweron","ext","sw","panic","int_wdt","task_wdt",
+                        "wdt","deepsleep","brownout","sdio"};
+    int r = (int)esp_reset_reason();
+    Serial.printf("{\"t\":\"boot\",\"reset\":\"%s\"}\n", (r>=0 && r<=10) ? rr[r] : "?"); }
   uiPrefs.begin("mwui", false);
   fwdOn = uiPrefs.getBool("fwd", false);
   fwdCh = uiPrefs.getUChar("fwdch", 0);
@@ -2733,8 +2737,13 @@ void loop() {
     }
   }
 
+  // Signed delta: wake() stamps lastInput with a millis() read taken a few ms
+  // after this loop's `now`, so an unsigned `now - lastInput` underflows to a
+  // huge value and the device would re-sleep on the very iteration it woke on —
+  // leaving draw() gated off forever (a frozen, back-lit frame). A signed
+  // compare reads that "just woke" case as a small negative idle, not a timeout.
   if (!asleep && screenOffSecs && !tracking && now >= bannerUntil &&
-      now - lastInput > screenOffSecs * 1000UL) {
+      (int32_t)(now - lastInput) > (int32_t)(screenOffSecs * 1000UL)) {
     asleep = true;
     M5.Display.setBrightness(0);
   }
